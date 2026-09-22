@@ -713,6 +713,14 @@ class SettingsEditorApp(tk.Tk):
 		self.frame_skip_var = tk.IntVar(value=0)
 		ttk.Spinbox(tab2, from_=0, to=10000, textvariable=self.frame_skip_var, width=8, command=self._set_dirty).grid(row=6, column=1, sticky='w', padx=8)
 
+		ttk.Label(tab2, text='Motion history frames').grid(row=7, column=0, sticky='w', padx=8, pady=(6,0))
+		self.motion_history_frames_var = tk.IntVar(value=3)
+		ttk.Spinbox(tab2, from_=1, to=3, textvariable=self.motion_history_frames_var, width=8, command=self._set_dirty).grid(row=7, column=1, sticky='w', padx=8)
+
+		ttk.Label(tab2, text='Motion frame gap').grid(row=8, column=0, sticky='w', padx=8, pady=(6,0))
+		self.motion_frame_gap_var = tk.IntVar(value=1)
+		ttk.Spinbox(tab2, from_=1, to=10000, textvariable=self.motion_frame_gap_var, width=8, command=self._set_dirty).grid(row=8, column=1, sticky='w', padx=8)
+
 		# TAB 3: Model type
 		tab3 = ttk.Frame(notebook)
 		notebook.add(tab3, text='Model type')
@@ -901,6 +909,8 @@ class SettingsEditorApp(tk.Tk):
 		self.lum_weight_var.set(float(d.get('lum_weight', fallback='0.5')))
 		self.rgb_mult_var.set(d.get('rgb_multipliers', fallback='4,4,4'))
 		self.frame_skip_var.set(int(d.get('frame_skip', fallback='0')))
+		self.motion_history_frames_var.set(int(d.get('motion_history_frames', fallback='3')))
+		self.motion_frame_gap_var.set(int(d.get('motion_frame_gap', fallback=str(self.frame_skip_var.get() + 1))))
 		# ~ self.scale_factor_var.set(float(d.get('scale_factor', fallback='1.0')))
 
 		# Save a snapshot of motion-related settings for later change detection
@@ -912,6 +922,8 @@ class SettingsEditorApp(tk.Tk):
 			'lum_weight': str(d.get('lum_weight', fallback='0.5')),
 			'rgb_multipliers': str(d.get('rgb_multipliers', fallback='4,4,4')).replace(' ', ''),
 			'frame_skip': str(d.get('frame_skip', fallback='0')),
+			'motion_history_frames': str(d.get('motion_history_frames', fallback='3')),
+			'motion_frame_gap': str(d.get('motion_frame_gap', fallback=str(self.frame_skip_var.get() + 1))),
 			'motion_blocks_static': str(d.get('motion_blocks_static', fallback='false')).lower(),
 			'static_blocks_motion': str(d.get('static_blocks_motion', fallback='false')).lower(),
 		}
@@ -1056,6 +1068,8 @@ class SettingsEditorApp(tk.Tk):
 			'lum_weight': str(self.lum_weight_var.get()),
 			'rgb_multipliers': str(self.rgb_mult_var.get()).replace(' ', ''),
 			'frame_skip': str(self.frame_skip_var.get()),
+			'motion_history_frames': str(self.motion_history_frames_var.get()),
+			'motion_frame_gap': str(self.motion_frame_gap_var.get()),
 			'motion_blocks_static': str(self.motion_blocks_static_var.get()).lower(),
 			'static_blocks_motion': str(self.static_blocks_motion_var.get()).lower(),
 		}
@@ -1155,6 +1169,18 @@ class SettingsEditorApp(tk.Tk):
 
 	def on_save(self):
 		# ---- validation ----
+		try:
+			motion_history_frames = self.motion_history_frames_var.get()
+			motion_frame_gap = self.motion_frame_gap_var.get()
+		except tk.TclError:
+			messagebox.showwarning("Invalid motion settings", "Motion history and frame gap must be whole numbers.")
+			return
+		if not 1 <= motion_history_frames <= 3 or motion_frame_gap < 1:
+			messagebox.showwarning(
+				"Invalid motion settings",
+				"Motion history must be between 1 and 3, and motion frame gap must be at least 1.")
+			return
+
 		hotkey_errors = self._validate_hotkeys()
 		if hotkey_errors:
 			messagebox.showwarning(
@@ -1234,6 +1260,8 @@ class SettingsEditorApp(tk.Tk):
 		new_default['lum_weight'] = str(self.lum_weight_var.get())
 		new_default['rgb_multipliers'] = self.rgb_mult_var.get()
 		new_default['frame_skip'] = str(self.frame_skip_var.get())
+		new_default['motion_history_frames'] = str(self.motion_history_frames_var.get())
+		new_default['motion_frame_gap'] = str(self.motion_frame_gap_var.get())
 		# ~ new_default['scale_factor'] = str(self.scale_factor_var.get())
 	
 		# model type

@@ -15,6 +15,7 @@ import platform
 import subprocess
 import box_geometry as bg
 from kalman_tracker import KalmanTracker
+from motion_processor import MotionProcessor
 
 
 
@@ -288,6 +289,8 @@ try:
 	line_thickness = int(config['DEFAULT'].get('line_thickness','1'))
 	font_size = float(config['DEFAULT'].get('font_size','0.5'))
 	frame_skip = int(config['DEFAULT'].get('frame_skip','0'))
+	motion_history_frames = int(config['DEFAULT'].get('motion_history_frames', '3'))
+	motion_frame_gap = int(config['DEFAULT'].get('motion_frame_gap', str(frame_skip + 1)))
 
 	process_noise_pos_ratio = float(config['kalman'].get('process_noise_pos_ratio','0.05'))
 	process_noise_vel_ratio = float(config['kalman'].get('process_noise_vel_ratio','0.1'))
@@ -355,7 +358,6 @@ class CameraProcessor:
 		self.ornt_motion_models = {}
 
 		# frame buffers
-		self.prev_frames = None
 
 		# ensure output dirs
 		os.makedirs(clips_dir, exist_ok=True)
@@ -727,9 +729,14 @@ class CameraProcessor:
 			csv_header += ["angle_deg", "width", "length"]
 		csv_writer.writerow(csv_header)
 
-		prev_frames = None
+		motion_processor = MotionProcessor(
+			history_frames=motion_history_frames, frame_gap=motion_frame_gap,
+			strategy=strategy, exp_a=expA, exp_b=expB, lum_weight=lum_weight,
+			rgb_multipliers=rgb_multipliers, motion_threshold=motion_threshold,
+			chromatic_tail_only=chromatic_tail_only == 'true')
 		frame_idx = 0
 		frame_count = 0
+		motion_enabled = primary_motion_classes[0] != '0' or secondary_motion_classes[0] != '0'
 
 		cv2.namedWindow(self.show_window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL | cv2.WINDOW_KEEPRATIO)
 
@@ -743,12 +750,11 @@ class CameraProcessor:
 			if scale_factor != 1.0:
 				raw_frame = cv2.resize(raw_frame, None, fx=scale_factor, fy=scale_factor)
 
-			gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
 			frame = raw_frame.copy()
+			motion_image = motion_processor.update(frame) if motion_enabled else frame.copy()
 
-			# initialize prev_frames (identical behaviour)
-			if prev_frames is None:
-				prev_frames = [gray.copy() for _ in range(3)]
+			# The first frame in each gap phase has no earlier comparison frame.
+			if motion_enabled and motion_image is None:
 				motion_image = frame.copy()
 				tnow = time.time(); self.frame_timestamps.append(tnow)
 				while self.frame_timestamps and (tnow - self.frame_timestamps[0]) > 1.0:
@@ -764,30 +770,6 @@ class CameraProcessor:
 					target = 1.0 / self.desired_fps; elapsed = time.time() - frame_start_time
 					if elapsed < target: time.sleep(target - elapsed)
 				continue
-
-			# Motion processing
-			if primary_motion_classes[0] != '0' or secondary_motion_classes[0] != '0':
-				diffs = [cv2.absdiff(prev_frames[j], gray) for j in range(3)]
-				if strategy == 'exponential':
-					prev_frames[0] = gray
-					prev_frames[1] = cv2.addWeighted(prev_frames[1], expA, gray, 1 - expA, 0)
-					prev_frames[2] = cv2.addWeighted(prev_frames[2], expB, gray, 1 - expB, 0)
-				else:
-					prev_frames[2] = prev_frames[1]; prev_frames[1] = prev_frames[0]; prev_frames[0] = gray
-
-				if chromatic_tail_only == 'true':
-					tb = cv2.subtract(diffs[0], diffs[1]); tr = cv2.subtract(diffs[2], diffs[1]); tg = cv2.subtract(diffs[1], diffs[0])
-					blue = cv2.addWeighted(gray, lum_weight, tb, rgb_multipliers[2], motion_threshold)
-					green = cv2.addWeighted(gray, lum_weight, tg, rgb_multipliers[1], motion_threshold)
-					red = cv2.addWeighted(gray, lum_weight, tr, rgb_multipliers[0], motion_threshold)
-				else:
-					blue = cv2.addWeighted(gray, lum_weight, diffs[0], rgb_multipliers[2], motion_threshold)
-					green = cv2.addWeighted(gray, lum_weight, diffs[1], rgb_multipliers[1], motion_threshold)
-					red = cv2.addWeighted(gray, lum_weight, diffs[2], rgb_multipliers[0], motion_threshold)
-
-				motion_image = cv2.merge((blue, green, red)).astype(np.uint8)
-			else:
-				motion_image = frame.copy()
 
 			# Primary detections
 			all_detections = []

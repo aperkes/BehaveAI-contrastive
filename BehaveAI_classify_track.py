@@ -14,6 +14,7 @@ import subprocess
 import sys
 import box_geometry as bg
 from kalman_tracker import KalmanTracker
+from motion_processor import MotionProcessor
 
 
 # --- NCNN helper utilities -----------------------
@@ -322,6 +323,8 @@ try:
 	line_thickness = int(config['DEFAULT'].get('line_thickness', '1'))
 	font_size = float(config['DEFAULT'].get('font_size', '0.5'))
 	frame_skip = int(config['DEFAULT'].get('frame_skip', '0'))
+	motion_history_frames = int(config['DEFAULT'].get('motion_history_frames', '3'))
+	motion_frame_gap = int(config['DEFAULT'].get('motion_frame_gap', str(frame_skip + 1)))
 
 	process_noise_pos_ratio = float(config['kalman'].get('process_noise_pos_ratio', '0.05'))
 	process_noise_vel_ratio = float(config['kalman'].get('process_noise_vel_ratio', '0.1'))
@@ -697,9 +700,6 @@ if primary_motion_classes[0] != '0':
 
 # --- PARAMETERS -----------------------------------------------------------
 
-expA2 = 1 - expA
-expB2 = 1 - expB
-
 #input_folder = "./input/"
 #output_folder = "./output/"
 
@@ -742,7 +742,12 @@ def process_video(file):
 							 process_noise_pos_ratio, process_noise_vel_ratio, measurement_noise_ratio,
 							 merge_aware=merge_aware, frames_per_step=frame_skip + 1)
 
-	prev_frames, frame_idx = None, 0
+	motion_processor = MotionProcessor(
+		history_frames=motion_history_frames, frame_gap=motion_frame_gap,
+		strategy=strategy, exp_a=expA, exp_b=expB, lum_weight=lum_weight,
+		rgb_multipliers=rgb_multipliers, motion_threshold=motion_threshold,
+		chromatic_tail_only=chromatic_tail_only == 'true')
+	frame_idx = 0
 	csv_file = open(os.path.join(output_folder, base + "_tracking.csv"), 'w', newline='')
 	csv_writer = csv.writer(csv_file)
 	# Updated CSV header with four streams
@@ -769,44 +774,17 @@ def process_video(file):
 		ret, raw_frame = cap.read()
 		if not ret: break
 		frame_idx += 1
+		if scale_factor != 1.0:
+			raw_frame = cv2.resize(raw_frame, None, fx=scale_factor, fy=scale_factor)
+		motion_candidate = motion_processor.update(raw_frame) if primary_motion_classes[0] != '0' else None
 		if frame_count == 0:
-			if scale_factor != 1.0:
-				raw_frame = cv2.resize(raw_frame, None, fx=scale_factor, fy=scale_factor)
-			gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
 			frame = raw_frame.copy()
-			if prev_frames is None:
-				prev_frames = [gray.copy() for _ in range(3)]
+			if primary_motion_classes[0] != '0' and motion_candidate is None:
+				frame_count += 1
+				if frame_count > frame_skip:
+					frame_count = 0
 				continue
-			
-			# only process motion information if necessary
-			if primary_motion_classes[0] != '0':
-	
-				diffs = [cv2.absdiff(prev_frames[j], gray) for j in range(3)]
-				
-				if strategy == 'exponential':
-					prev_frames[0] = gray
-					prev_frames[1] = cv2.addWeighted(prev_frames[1], expA, gray, expA2, 0)
-					prev_frames[2] = cv2.addWeighted(prev_frames[2], expB, gray, expB2, 0)
-				elif strategy == 'sequential':
-					prev_frames[2] = prev_frames[1]
-					prev_frames[1] = prev_frames[0]
-					prev_frames[0] = gray
-
-
-				if chromatic_tail_only == 'true':
-					tb = cv2.subtract(diffs[0], diffs[1])	
-					tr = cv2.subtract(diffs[2], diffs[1])
-					tg = cv2.subtract(diffs[1], diffs[0])
-							
-					blue = cv2.addWeighted(gray, lum_weight, tb, rgb_multipliers[2], motion_threshold)
-					green = cv2.addWeighted(gray, lum_weight, tg, rgb_multipliers[1], motion_threshold)
-					red = cv2.addWeighted(gray, lum_weight, tr, rgb_multipliers[0], motion_threshold)
-				else:
-					blue = cv2.addWeighted(gray, lum_weight, diffs[0], rgb_multipliers[2], motion_threshold)
-					green = cv2.addWeighted(gray, lum_weight, diffs[1], rgb_multipliers[1], motion_threshold)
-					red = cv2.addWeighted(gray, lum_weight, diffs[2], rgb_multipliers[0], motion_threshold)
-
-				motion_image = cv2.merge((blue, green, red)).astype(np.uint8)
+			motion_image = motion_candidate
 	
 			# Collect all primary detections
 			all_detections = []

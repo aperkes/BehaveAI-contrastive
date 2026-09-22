@@ -16,6 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 from index_annotations import AnnotationIndex
 import box_geometry as bg
+from motion_processor import MotionProcessor, motion_warmup_samples
 
 
 # Try to import YOLO
@@ -195,6 +196,8 @@ try:
 	static_blocks_motion = config['DEFAULT']['static_blocks_motion'].lower()
 	save_empty_frames = config['DEFAULT']['save_empty_frames'].lower()
 	frame_skip = int(config['DEFAULT'].get('frame_skip', '0'))
+	motion_history_frames = int(config['DEFAULT'].get('motion_history_frames', '3'))
+	motion_frame_gap = int(config['DEFAULT'].get('motion_frame_gap', str(frame_skip + 1)))
 	motion_threshold = -1 * int(config['DEFAULT'].get('motion_threshold', '0'))
 	
 except KeyError as e:
@@ -283,21 +286,10 @@ video_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
 # frameWindow logic
 right_frame_width = max(96, int(video_height / 3))
-frameWindow = 4
-if strategy == 'exponential':
-	if expA > 0.2 or expB > 0.2:
-		frameWindow = 5
-	if expA > 0.5 or expB > 0.5:
-		frameWindow = 10
-	if expA > 0.7 or expB > 0.7:
-		frameWindow = 15
-	if expA > 0.8 or expB > 0.8:
-		frameWindow = 20
-	if expA > 0.9 or expB > 0.9:
-		frameWindow = 45
+frameWindow = motion_warmup_samples(strategy, expA, expB, motion_history_frames)
 
 raw_buf = deque(maxlen=frameWindow)
-frameWindow = frameWindow * (frame_skip + 1)
+frameWindow = (frameWindow - 1) * motion_frame_gap + 1
 frame_number = min(max(frameWindow - 1, 0), total_frames - 1)
 frame_updated = True
 
@@ -2043,13 +2035,9 @@ class AnnotatorTk:
 			frame_updated = False
 			boxes.clear(); grey_boxes.clear()
 			last_frame = frame_number
-			# Sample every `step` frames so the LAST sampled (kept) frame lands exactly on
-			# last_frame - matches the base_N/step math in Regenerate_annotations.py and
-			# BehaveAI_inspect_dataset.py. The previous `last_frame - frameWindow + 1` start
-			# (frameWindow already being base_N*step) put the final "keep" slot frame_skip
-			# frames short of last_frame whenever frame_skip > 0, so the image actually shown/
-			# saved for a given frame_number was really frame_number - frame_skip.
-			step = frame_skip + 1
+			# End the configured motion-history window exactly on the selected frame.
+			# Regeneration and dataset inspection use the same base_N/step calculation.
+			step = motion_frame_gap
 			base_N = raw_buf.maxlen
 			start_frame = last_frame - (base_N - 1) * step
 			if start_frame < 0:
@@ -2060,51 +2048,27 @@ class AnnotatorTk:
 				need_ = True
 			else:
 				capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-				prev_frames = [None] * 3
+				motion_processor = MotionProcessor(
+					history_frames=motion_history_frames, frame_gap=step,
+					strategy=strategy, exp_a=expA, exp_b=expB,
+					lum_weight=lum_weight, rgb_multipliers=rgb_multipliers,
+					motion_threshold=motion_threshold,
+					chromatic_tail_only=chromatic_tail_only == 'true')
 				motion_image = None
-				frame_count = 0
 				raw_buf.clear()
 				for i in range((base_N - 1) * step + 1):
 					ret, raw_frame = capture.read()
 					if not ret:
 						break
-					if frame_count == 0:
-						fr = raw_frame.copy()
-						if scale_factor != 1.0:
-							fr = cv2.resize(fr, (0,0), fx=scale_factor, fy=scale_factor)
+					fr = raw_frame.copy()
+					if scale_factor != 1.0:
+						fr = cv2.resize(fr, (0,0), fx=scale_factor, fy=scale_factor)
+					candidate = motion_processor.update(fr)
+					if i % step == 0:
 						raw_buf.append(fr.copy())
-						gray = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
-						if i == 0:
-							prev_frames = [gray.copy()] * 3
-							frame_count += 1
-							if frame_count > frame_skip:
-								frame_count = 0
-							continue
-						diffs = [cv2.absdiff(prev_frames[j], gray) for j in range(3)]
-						if strategy == 'exponential':
-							prev_frames[0] = gray
-							prev_frames[1] = cv2.addWeighted(prev_frames[1], expA, gray, 1-expA, 0)
-							prev_frames[2] = cv2.addWeighted(prev_frames[2], expB, gray, 1-expB, 0)
-						else:
-							prev_frames[2] = prev_frames[1]
-							prev_frames[1] = prev_frames[0]
-							prev_frames[0] = gray
-					frame_count += 1
-					if frame_count > frame_skip:
-						frame_count = 0
-				if 'diffs' in locals():
-					if chromatic_tail_only == 'true':
-						tb = cv2.subtract(diffs[0], diffs[1])
-						tr = cv2.subtract(diffs[2], diffs[1])
-						tg = cv2.subtract(diffs[1], diffs[0])
-						blue = cv2.addWeighted(gray, lum_weight, tb, rgb_multipliers[2], motion_threshold)
-						green = cv2.addWeighted(gray, lum_weight, tg, rgb_multipliers[1], motion_threshold)
-						red = cv2.addWeighted(gray, lum_weight, tr, rgb_multipliers[0], motion_threshold)
-					else:
-						blue = cv2.addWeighted(gray, lum_weight, diffs[0], rgb_multipliers[2], motion_threshold)
-						green = cv2.addWeighted(gray, lum_weight, diffs[1], rgb_multipliers[1], motion_threshold)
-						red = cv2.addWeighted(gray, lum_weight, diffs[2], rgb_multipliers[0], motion_threshold)
-					motion_image = cv2.merge((blue, green, red)).astype(np.uint8)
+					if candidate is not None:
+						motion_image = candidate
+				if motion_image is not None:
 					original_frame = motion_image.copy()
 					
 

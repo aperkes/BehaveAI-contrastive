@@ -14,6 +14,7 @@ import sys
 from PIL import Image, ImageTk
 from index_annotations import AnnotationIndex
 import box_geometry as bg
+from motion_processor import motion_warmup_samples
 
 
 # Optional YOLO import
@@ -186,6 +187,8 @@ try:
 	static_blocks_motion = config['DEFAULT']['static_blocks_motion'].lower()
 	save_empty_frames = config['DEFAULT']['save_empty_frames'].lower()
 	frame_skip = int(config['DEFAULT'].get('frame_skip', '0'))
+	motion_history_frames = int(config['DEFAULT'].get('motion_history_frames', '3'))
+	motion_frame_gap = int(config['DEFAULT'].get('motion_frame_gap', str(frame_skip + 1)))
 	motion_threshold = -1 * int(config['DEFAULT'].get('motion_threshold', '0'))
 
 except KeyError as e:
@@ -207,9 +210,6 @@ if static_blocks_motion not in ('true','false'):
 if save_empty_frames not in ('true','false'):
 	raise ValueError("save_empty_frames must be true or false")
 
-expA2 = 1 - expA
-expB2 = 1 - expB
-
 primary_classes_info = list(zip(primary_hotkeys, primary_classes))
 secondary_classes_info = list(zip(secondary_hotkeys, secondary_classes))
 primary_class_dict = {ord(key): idx for idx, (key, _) in enumerate(primary_classes_info)}
@@ -220,13 +220,7 @@ secondary_class_dict = {ord(key): idx for idx, (key, _) in enumerate(secondary_c
 active_primary = next((i for i, name in enumerate(primary_classes) if name != '0'), 0)
 active_secondary = 0
 
-frameWindow = 4
-if strategy == 'exponential':
-	if expA > 0.2 or expB > 0.2: frameWindow = 5
-	if expA > 0.5 or expB > 0.5: frameWindow = 10
-	if expA > 0.7 or expB > 0.7: frameWindow = 15
-	if expA > 0.8 or expB > 0.8: frameWindow = 20
-	if expA > 0.9 or expB > 0.9: frameWindow = 45
+frameWindow = motion_warmup_samples(strategy, expA, expB, motion_history_frames)
 
 raw_buf = deque(maxlen=frameWindow)
 
@@ -625,7 +619,7 @@ def load_item(idx):
 			if guessed_frame is not None and video_capture.isOpened():
 				total = int(video_capture.get(cv2.CAP_PROP_FRAME_COUNT))
 				base_N = raw_buf.maxlen				 # frameWindow_base (number of frames we want)
-				step = frame_skip + 1				  # sampling interval
+				step = motion_frame_gap				  # motion sampling interval
 				total_to_read = base_N * step		  # how many raw frames to read in worst case
 
 				def _read_buffer_ending_at(last_frame):

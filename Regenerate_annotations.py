@@ -20,8 +20,8 @@ import configparser
 import glob
 import sys
 import time
-from collections import deque
 import box_geometry as bg
+from motion_processor import build_motion_image, motion_warmup_samples
 
 # optional GUI prompt if INI not supplied
 try:
@@ -69,6 +69,8 @@ def load_config(config_path):
 		params['lum_weight'] = float(config['DEFAULT'].get('lum_weight', '0.7'))
 		params['rgb_multipliers'] = [float(x) for x in config['DEFAULT'].get('rgb_multipliers', '2,2,2').split(',')]
 		params['frame_skip'] = int(config['DEFAULT'].get('frame_skip', '0'))
+		params['motion_history_frames'] = int(config['DEFAULT'].get('motion_history_frames', '3'))
+		params['motion_frame_gap'] = int(config['DEFAULT'].get('motion_frame_gap', str(params['frame_skip'] + 1)))
 		params['motion_threshold'] = -1 * int(config['DEFAULT'].get('motion_threshold', '0'))
 		params['motion_blocks_static'] = config['DEFAULT'].get('motion_blocks_static', 'false').lower()
 		params['static_blocks_motion'] = config['DEFAULT'].get('static_blocks_motion', 'false').lower()
@@ -83,22 +85,12 @@ def load_config(config_path):
 		params['primary_static_classes'] = [] if (not static_classes or static_classes[0] == '0') else static_classes
 		params['primary_motion_classes'] = [] if (not motion_classes or motion_classes[0] == '0') else motion_classes
 
-		# Compute base frame window size (number of sampled frames)
-		base_window = 4
-		if params['strategy'] == 'exponential':
-			if params['expA'] > 0.2 or params['expB'] > 0.2:
-				base_window = 5
-			if params['expA'] > 0.5 or params['expB'] > 0.5:
-				base_window = 10
-			if params['expA'] > 0.7 or params['expB'] > 0.7:
-				base_window = 15
-			if params['expA'] > 0.8 or params['expB'] > 0.8:
-				base_window = 20
-			if params['expA'] > 0.9 or params['expB'] > 0.9:
-				base_window = 45
+		base_window = motion_warmup_samples(
+			params['strategy'], params['expA'], params['expB'],
+			params['motion_history_frames'])
 
 		params['base_frame_window'] = base_window
-		params['frame_window'] = base_window * (params['frame_skip'] + 1)
+		params['frame_window'] = (base_window - 1) * params['motion_frame_gap'] + 1
 
 	except KeyError as e:
 		raise KeyError(f"Missing configuration parameter: {e}")
@@ -131,7 +123,7 @@ def generate_base_images(video_path, frame_num, params):
 		cap.release()
 		return None, None
 
-	step = params['frame_skip'] + 1
+	step = params['motion_frame_gap']
 	base_N = params.get('base_frame_window', 4)
 
 	# compute start so last appended index should equal frame_num
@@ -145,77 +137,31 @@ def generate_base_images(video_path, frame_num, params):
 	cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 	collected = []
 	read_count = 0
-	idx = start_frame
-	# safety limit: don't try more than frame_window + some slack
-	max_reads = params['frame_window'] + 10
-
-	while len(collected) < base_N and idx <= total_frames - 1 and read_count <= max_reads:
+	while read_count < params['frame_window'] and start_frame + read_count <= total_frames - 1:
 		ret, frame = cap.read()
 		if not ret:
 			break
-		if (read_count % step) == 0:
-			if params['scale_factor'] != 1.0:
-				frame = cv2.resize(frame, None, fx=params['scale_factor'], fy=params['scale_factor'])
-			collected.append(frame.copy())
+		if params['scale_factor'] != 1.0:
+			frame = cv2.resize(frame, None, fx=params['scale_factor'], fy=params['scale_factor'])
+		collected.append(frame.copy())
 		read_count += 1
-		idx += 1
 
 	if not collected:
 		cap.release()
 		print(f"Could not collect frames for target {frame_num} (start {start_frame}) in {video_path}")
 		return None, None
 
-	# Process collected frames to produce diffs for the last frame
-	prev_frames = [None] * 3
-	static_img = None
-	diffs = None
-	gray = None
-
-	for i, f in enumerate(collected):
-		if f is None:
-			continue
-		frame_bgr = f
-		gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-
-		if static_img is None:
-			static_img = frame_bgr.copy()
-			prev_frames = [gray.copy()] * 3
-			continue
-
-		current_diffs = [cv2.absdiff(prev_frames[j], gray) for j in range(3)]
-
-		if params['strategy'] == 'exponential':
-			prev_frames[0] = gray
-			prev_frames[1] = cv2.addWeighted(prev_frames[1], params['expA'], gray, 1 - params['expA'], 0)
-			prev_frames[2] = cv2.addWeighted(prev_frames[2], params['expB'], gray, 1 - params['expB'], 0)
-		elif params['strategy'] == 'sequential':
-			prev_frames[2] = prev_frames[1]
-			prev_frames[1] = prev_frames[0]
-			prev_frames[0] = gray
-
-		static_img = frame_bgr.copy()
-		diffs = current_diffs
-
-	if diffs is None or gray is None:
+	static_img = collected[-1].copy()
+	motion_img = build_motion_image(
+		collected, history_frames=params['motion_history_frames'], frame_gap=step,
+		strategy=params['strategy'], exp_a=params['expA'], exp_b=params['expB'],
+		lum_weight=params['lum_weight'], rgb_multipliers=params['rgb_multipliers'],
+		motion_threshold=params['motion_threshold'],
+		chromatic_tail_only=params['chromatic_tail_only'] == 'true')
+	if motion_img is None:
 		cap.release()
 		print(f"Insufficient frames to compute diffs for {frame_num} (collected {len(collected)} frames)")
 		return None, None
-
-	# Build motion image (chromatic tail or normal)
-	if params['chromatic_tail_only'] == 'true':
-		tb = cv2.subtract(diffs[0], diffs[1])
-		tr = cv2.subtract(diffs[2], diffs[1])
-		tg = cv2.subtract(diffs[1], diffs[0])
-
-		blue = cv2.addWeighted(gray, params['lum_weight'], tb, params['rgb_multipliers'][2], params['motion_threshold'])
-		green = cv2.addWeighted(gray, params['lum_weight'], tg, params['rgb_multipliers'][1], params['motion_threshold'])
-		red = cv2.addWeighted(gray, params['lum_weight'], tr, params['rgb_multipliers'][0], params['motion_threshold'])
-	else:
-		blue = cv2.addWeighted(gray, params['lum_weight'], diffs[0], params['rgb_multipliers'][2], params['motion_threshold'])
-		green = cv2.addWeighted(gray, params['lum_weight'], diffs[1], params['rgb_multipliers'][1], params['motion_threshold'])
-		red = cv2.addWeighted(gray, params['lum_weight'], diffs[2], params['rgb_multipliers'][0], params['motion_threshold'])
-
-	motion_img = cv2.merge([blue, green, red]).astype(np.uint8)
 
 	cap.release()
 	return static_img, motion_img
