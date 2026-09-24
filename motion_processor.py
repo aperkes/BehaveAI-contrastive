@@ -75,30 +75,11 @@ class MotionProcessor:
 		history.append(gray.copy())
 
 	@staticmethod
-	def _one_frame_flow_channels(previous_gray, gray):
-		"""Return BGR motion layers with blue sources and red destinations."""
-		flow = cv2.calcOpticalFlowFarneback(
-			previous_gray, gray, None,
-			pyr_scale=0.5, levels=3, winsize=15, iterations=3,
-			poly_n=5, poly_sigma=1.2, flags=0)
-		magnitude = cv2.magnitude(flow[..., 0], flow[..., 1])
-		magnitude[magnitude < 0.1] = 0
-		gradient_x = cv2.Sobel(previous_gray, cv2.CV_32F, 1, 0, ksize=3)
-		gradient_y = cv2.Sobel(previous_gray, cv2.CV_32F, 0, 1, ksize=3)
-		edge_strength = cv2.magnitude(gradient_x, gradient_y)
-		strength = np.clip(edge_strength * np.minimum(magnitude, 1.0), 0, 255).astype(np.uint8)
-
-		# Dense flow is defined at the source (previous-frame) pixels. Keep those
-		# pixels blue, then forward-splat their strength to their destinations in red.
-		height, width = gray.shape
-		y, x = np.indices((height, width))
-		dest_x = np.rint(x + flow[..., 0]).astype(np.int32)
-		dest_y = np.rint(y + flow[..., 1]).astype(np.int32)
-		valid = ((strength > 0) & (dest_x >= 0) & (dest_x < width) &
-				 (dest_y >= 0) & (dest_y < height))
-		leading = np.zeros_like(strength)
-		np.maximum.at(leading, (dest_y[valid], dest_x[valid]), strength[valid])
-		return strength, np.zeros_like(strength), leading
+	def _one_frame_difference_channels(previous_gray, gray):
+		"""Return signed BGR differences: negative blue and positive red."""
+		negative = cv2.subtract(previous_gray, gray)
+		positive = cv2.subtract(gray, previous_gray)
+		return negative, np.zeros_like(gray), positive
 
 	def update(self, frame):
 		"""Consume one source frame and compare it with its same-gap history."""
@@ -143,7 +124,7 @@ class MotionProcessor:
 			previous[0] = gray
 
 		if self.history_frames == 1:
-			channels = self._one_frame_flow_channels(previous_gray, gray)
+			channels = self._one_frame_difference_channels(previous_gray, gray)
 		else:
 			if self.history_frames == 2:
 				diffs = [diffs[0], diffs[1], diffs[1]]
