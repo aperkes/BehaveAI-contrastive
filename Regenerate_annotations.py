@@ -65,6 +65,7 @@ def load_config(config_path):
 		params['expA'] = float(config['DEFAULT'].get('expA', '0.5'))
 		params['expB'] = float(config['DEFAULT'].get('expB', '0.8'))
 		params['strategy'] = config['DEFAULT'].get('strategy', 'exponential')
+		params['sliding_median_window'] = int(config['DEFAULT'].get('sliding_median_window', '50'))
 		params['chromatic_tail_only'] = config['DEFAULT'].get('chromatic_tail_only', 'false').lower()
 		params['lum_weight'] = float(config['DEFAULT'].get('lum_weight', '0.7'))
 		params['rgb_multipliers'] = [float(x) for x in config['DEFAULT'].get('rgb_multipliers', '2,2,2').split(',')]
@@ -87,7 +88,7 @@ def load_config(config_path):
 
 		base_window = motion_warmup_samples(
 			params['strategy'], params['expA'], params['expB'],
-			params['motion_history_frames'])
+			params['motion_history_frames'], params['sliding_median_window'])
 
 		params['base_frame_window'] = base_window
 		params['frame_window'] = (base_window - 1) * params['motion_frame_gap'] + 1
@@ -157,7 +158,8 @@ def generate_base_images(video_path, frame_num, params):
 		strategy=params['strategy'], exp_a=params['expA'], exp_b=params['expB'],
 		lum_weight=params['lum_weight'], rgb_multipliers=params['rgb_multipliers'],
 		motion_threshold=params['motion_threshold'],
-		chromatic_tail_only=params['chromatic_tail_only'] == 'true')
+		chromatic_tail_only=params['chromatic_tail_only'] == 'true',
+		median_window=params['sliding_median_window'])
 	if motion_img is None:
 		cap.release()
 		print(f"Insufficient frames to compute diffs for {frame_num} (collected {len(collected)} frames)")

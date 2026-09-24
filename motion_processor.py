@@ -1,14 +1,21 @@
 """Shared construction of BehaveAI motion images from video frames."""
 
+from collections import deque
+
 import cv2
 import numpy as np
 
 
-def motion_warmup_samples(strategy, exp_a, exp_b, history_frames=3):
+def motion_warmup_samples(strategy, exp_a, exp_b, history_frames=3, median_window=50):
 	"""Return the sampled-frame window needed to reproduce a motion image."""
 	history_frames = int(history_frames)
 	if not 1 <= history_frames <= 3:
 		raise ValueError("motion_history_frames must be between 1 and 3")
+	median_window = int(median_window)
+	if median_window < 1:
+		raise ValueError("sliding_median_window must be at least 1")
+	if strategy == 'sliding_median':
+		return median_window + 1
 	window = history_frames + 1
 	if strategy == 'exponential' and history_frames > 1:
 		if exp_a > 0.2 or exp_b > 0.2: window = max(window, 5)
@@ -25,15 +32,18 @@ class MotionProcessor:
 	def __init__(self, history_frames=3, frame_gap=1, strategy='exponential',
 				 exp_a=0.5, exp_b=0.8, lum_weight=0.7,
 				 rgb_multipliers=(2, 2, 2), motion_threshold=0,
-				 chromatic_tail_only=False):
+				 chromatic_tail_only=False, median_window=50):
 		self.history_frames = int(history_frames)
 		self.frame_gap = int(frame_gap)
 		if not 1 <= self.history_frames <= 3:
 			raise ValueError("motion_history_frames must be between 1 and 3")
 		if self.frame_gap < 1:
 			raise ValueError("motion_frame_gap must be at least 1")
-		if strategy not in ('sequential', 'exponential'):
-			raise ValueError("strategy must be sequential or exponential")
+		if strategy not in ('sequential', 'exponential', 'sliding_median'):
+			raise ValueError("strategy must be sequential, exponential, or sliding_median")
+		self.median_window = int(median_window)
+		if self.median_window < 1:
+			raise ValueError("sliding_median_window must be at least 1")
 		self.strategy = strategy
 		self.exp_a = float(exp_a)
 		self.exp_b = float(exp_b)
@@ -46,6 +56,7 @@ class MotionProcessor:
 	def reset(self):
 		self._source_index = 0
 		self._previous_by_phase = {}
+		self._median_frames_by_phase = {}
 		self.last_motion_image = None
 
 	@staticmethod
@@ -79,6 +90,20 @@ class MotionProcessor:
 		phase = self._source_index % self.frame_gap
 		self._source_index += 1
 		gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+		if self.strategy == 'sliding_median':
+			history = self._median_frames_by_phase.get(phase)
+			if history is None:
+				history = deque(maxlen=self.median_window)
+				self._median_frames_by_phase[phase] = history
+			if not history:
+				history.append(gray.copy())
+				return None
+			background = np.median(np.stack(history), axis=0).astype(np.uint8)
+			difference = cv2.absdiff(gray, background)
+			history.append(gray.copy())
+			channels = (difference, difference, difference)
+			return self._render(gray, channels)
+
 		previous = self._previous_by_phase.get(phase)
 		if previous is None:
 			self._previous_by_phase[phase] = [gray.copy() for _ in range(self.history_frames)]
@@ -110,6 +135,9 @@ class MotionProcessor:
 			else:
 				channels = tuple(diffs)
 
+		return self._render(gray, channels)
+
+	def _render(self, gray, channels):
 		blue = cv2.addWeighted(gray, self.lum_weight, channels[0], self.rgb_multipliers[2], self.motion_threshold)
 		green = cv2.addWeighted(gray, self.lum_weight, channels[1], self.rgb_multipliers[1], self.motion_threshold)
 		red = cv2.addWeighted(gray, self.lum_weight, channels[2], self.rgb_multipliers[0], self.motion_threshold)

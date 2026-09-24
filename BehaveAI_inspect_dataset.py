@@ -176,6 +176,7 @@ try:
 
 	lum_weight = float(config['DEFAULT'].get('lum_weight', '0.7'))
 	strategy = config['DEFAULT'].get('strategy', 'exponential')
+	sliding_median_window = int(config['DEFAULT'].get('sliding_median_window', '50'))
 	chromatic_tail_only = config['DEFAULT']['chromatic_tail_only'].lower()
 	primary_conf_thresh = float(config['DEFAULT'].get('primary_conf_thresh', '0.5'))
 	secondary_conf_thresh = float(config['DEFAULT'].get('secondary_conf_thresh', '0.5'))
@@ -220,7 +221,8 @@ secondary_class_dict = {ord(key): idx for idx, (key, _) in enumerate(secondary_c
 active_primary = next((i for i, name in enumerate(primary_classes) if name != '0'), 0)
 active_secondary = 0
 
-frameWindow = motion_warmup_samples(strategy, expA, expB, motion_history_frames)
+frameWindow = motion_warmup_samples(
+	strategy, expA, expB, motion_history_frames, sliding_median_window)
 
 raw_buf = deque(maxlen=frameWindow)
 

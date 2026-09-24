@@ -183,6 +183,7 @@ try:
 
 	lum_weight = float(config['DEFAULT'].get('lum_weight', '0.7'))
 	strategy = config['DEFAULT'].get('strategy', 'exponential')
+	sliding_median_window = int(config['DEFAULT'].get('sliding_median_window', '50'))
 	chromatic_tail_only = config['DEFAULT']['chromatic_tail_only'].lower()
 	primary_conf_thresh = float(config['DEFAULT'].get('primary_conf_thresh', '0.5'))
 	secondary_conf_thresh = float(config['DEFAULT'].get('secondary_conf_thresh', '0.5'))
@@ -286,7 +287,8 @@ video_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
 # frameWindow logic
 right_frame_width = max(96, int(video_height / 3))
-frameWindow = motion_warmup_samples(strategy, expA, expB, motion_history_frames)
+frameWindow = motion_warmup_samples(
+	strategy, expA, expB, motion_history_frames, sliding_median_window)
 
 raw_buf = deque(maxlen=frameWindow)
 frameWindow = (frameWindow - 1) * motion_frame_gap + 1
@@ -2053,7 +2055,8 @@ class AnnotatorTk:
 					strategy=strategy, exp_a=expA, exp_b=expB,
 					lum_weight=lum_weight, rgb_multipliers=rgb_multipliers,
 					motion_threshold=motion_threshold,
-					chromatic_tail_only=chromatic_tail_only == 'true')
+					chromatic_tail_only=chromatic_tail_only == 'true',
+					median_window=sliding_median_window)
 				motion_image = None
 				raw_buf.clear()
 				for i in range((base_N - 1) * step + 1):

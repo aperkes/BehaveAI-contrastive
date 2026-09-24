@@ -686,8 +686,7 @@ class SettingsEditorApp(tk.Tk):
 
 		ttk.Label(tab2, text='Strategy').grid(row=0, column=0, sticky='w', padx=8, pady=(8,0))
 		self.strategy_var = tk.StringVar(value='exponential')
-		ttk.Combobox(tab2, values=['sequential', 'exponential'], textvariable=self.strategy_var, state='readonly').grid(row=0, column=1, sticky='w', padx=8, pady=(8,0))
-		self.strategy_var.trace_add('write', lambda *a: self._set_dirty())
+		ttk.Combobox(tab2, values=['sequential', 'exponential', 'sliding_median'], textvariable=self.strategy_var, state='readonly').grid(row=0, column=1, sticky='w', padx=8, pady=(8,0))
 
 		self.chromatic_tail_only_var = tk.BooleanVar(value=False)
 		ttk.Checkbutton(tab2, text='Chromatic tail only', variable=self.chromatic_tail_only_var, command=self._set_dirty).grid(row=1, column=0, sticky='w', padx=8, pady=(6,0))
@@ -720,6 +719,15 @@ class SettingsEditorApp(tk.Tk):
 		ttk.Label(tab2, text='Motion frame gap').grid(row=8, column=0, sticky='w', padx=8, pady=(6,0))
 		self.motion_frame_gap_var = tk.IntVar(value=1)
 		ttk.Spinbox(tab2, from_=1, to=10000, textvariable=self.motion_frame_gap_var, width=8, command=self._set_dirty).grid(row=8, column=1, sticky='w', padx=8)
+
+		self.sliding_median_label = ttk.Label(tab2, text='Sliding median window')
+		self.sliding_median_label.grid(row=9, column=0, sticky='w', padx=8, pady=(6,0))
+		self.sliding_median_window_var = tk.IntVar(value=50)
+		self.sliding_median_spinbox = ttk.Spinbox(
+			tab2, from_=1, to=10000, textvariable=self.sliding_median_window_var,
+			width=8, command=self._set_dirty, state='disabled')
+		self.sliding_median_spinbox.grid(row=9, column=1, sticky='w', padx=8)
+		self.strategy_var.trace_add('write', self._on_motion_strategy_changed)
 
 		# TAB 3: Model type
 		tab3 = ttk.Frame(notebook)
@@ -903,6 +911,7 @@ class SettingsEditorApp(tk.Tk):
 
 		# motion tab
 		self.strategy_var.set(d.get('strategy', fallback='exponential'))
+		self.sliding_median_window_var.set(int(d.get('sliding_median_window', fallback='50')))
 		self.chromatic_tail_only_var.set(self._str_to_bool(d.get('chromatic_tail_only', fallback='false')))
 		self.expA_var.set(float(d.get('expA', fallback='0.5')))
 		self.expB_var.set(float(d.get('expB', fallback='0.7')))
@@ -916,6 +925,7 @@ class SettingsEditorApp(tk.Tk):
 		# Save a snapshot of motion-related settings for later change detection
 		self._loaded_motion_settings = {
 			'strategy': str(d.get('strategy', fallback='sequential')),
+			'sliding_median_window': str(d.get('sliding_median_window', fallback='50')),
 			'chromatic_tail_only': str(d.get('chromatic_tail_only', fallback='false')).lower(),
 			'expA': str(d.get('expA', fallback='0.5')),
 			'expB': str(d.get('expB', fallback='0.7')),
@@ -1062,6 +1072,7 @@ class SettingsEditorApp(tk.Tk):
 			return True
 		curr = {
 			'strategy': str(self.strategy_var.get()),
+			'sliding_median_window': str(self.sliding_median_window_var.get()),
 			'chromatic_tail_only': str(self.chromatic_tail_only_var.get()).lower(),
 			'expA': str(self.expA_var.get()),
 			'expB': str(self.expB_var.get()),
@@ -1172,13 +1183,14 @@ class SettingsEditorApp(tk.Tk):
 		try:
 			motion_history_frames = self.motion_history_frames_var.get()
 			motion_frame_gap = self.motion_frame_gap_var.get()
+			sliding_median_window = self.sliding_median_window_var.get()
 		except tk.TclError:
-			messagebox.showwarning("Invalid motion settings", "Motion history and frame gap must be whole numbers.")
+			messagebox.showwarning("Invalid motion settings", "Motion history, frame gap, and median window must be whole numbers.")
 			return
-		if not 1 <= motion_history_frames <= 3 or motion_frame_gap < 1:
+		if not 1 <= motion_history_frames <= 3 or motion_frame_gap < 1 or sliding_median_window < 1:
 			messagebox.showwarning(
 				"Invalid motion settings",
-				"Motion history must be between 1 and 3, and motion frame gap must be at least 1.")
+				"Motion history must be between 1 and 3; frame gap and median window must be at least 1.")
 			return
 
 		hotkey_errors = self._validate_hotkeys()
@@ -1254,6 +1266,7 @@ class SettingsEditorApp(tk.Tk):
 	
 		# motion strategy
 		new_default['strategy'] = self.strategy_var.get()
+		new_default['sliding_median_window'] = str(self.sliding_median_window_var.get())
 		new_default['chromatic_tail_only'] = str(self.chromatic_tail_only_var.get()).lower()
 		new_default['expA'] = str(self.expA_var.get())
 		new_default['expB'] = str(self.expB_var.get())
@@ -1420,6 +1433,12 @@ class SettingsEditorApp(tk.Tk):
 		# If you later want to re-disable Save when no changes present, change below:
 		if self.dirty:
 			self.save_btn.config(state='normal')
+
+	def _on_motion_strategy_changed(self, *_args):
+		state = 'normal' if self.strategy_var.get() == 'sliding_median' else 'disabled'
+		self.sliding_median_spinbox.configure(state=state)
+		self.sliding_median_label.configure(state=state)
+		self._set_dirty()
 
 if __name__ == "__main__":
 	if len(sys.argv) != 2:

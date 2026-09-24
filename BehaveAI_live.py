@@ -275,6 +275,7 @@ try:
 	expB = float(config['DEFAULT'].get('expB','0.8'))
 	lum_weight = float(config['DEFAULT'].get('lum_weight','0.7'))
 	strategy = config['DEFAULT'].get('strategy','exponential')
+	sliding_median_window = int(config['DEFAULT'].get('sliding_median_window', '50'))
 	chromatic_tail_only = config['DEFAULT']['chromatic_tail_only'].lower()
 	rgb_multipliers = [float(x) for x in config['DEFAULT']['rgb_multipliers'].split(',')]
 	primary_conf_thresh = float(config['DEFAULT'].get('primary_conf_thresh','0.5'))
@@ -733,7 +734,8 @@ class CameraProcessor:
 			history_frames=motion_history_frames, frame_gap=motion_frame_gap,
 			strategy=strategy, exp_a=expA, exp_b=expB, lum_weight=lum_weight,
 			rgb_multipliers=rgb_multipliers, motion_threshold=motion_threshold,
-			chromatic_tail_only=chromatic_tail_only == 'true')
+			chromatic_tail_only=chromatic_tail_only == 'true',
+			median_window=sliding_median_window)
 		frame_idx = 0
 		frame_count = 0
 		motion_enabled = primary_motion_classes[0] != '0' or secondary_motion_classes[0] != '0'
