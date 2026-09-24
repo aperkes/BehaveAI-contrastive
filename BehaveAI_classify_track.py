@@ -309,6 +309,7 @@ try:
 	lum_weight = float(config['DEFAULT'].get('lum_weight', '0.7'))
 	strategy = config['DEFAULT'].get('strategy', 'exponential')
 	sliding_median_window = int(config['DEFAULT'].get('sliding_median_window', '50'))
+	sliding_median_signed_color = config['DEFAULT'].get('sliding_median_signed_color', 'false').lower() == 'true'
 	chromatic_tail_only = config['DEFAULT']['chromatic_tail_only'].lower()
 	rgb_multipliers = [float(x) for x in config['DEFAULT']['rgb_multipliers'].split(',')]
 	use_ncnn = config['DEFAULT']['use_ncnn'].lower()
@@ -748,7 +749,8 @@ def process_video(file):
 		strategy=strategy, exp_a=expA, exp_b=expB, lum_weight=lum_weight,
 		rgb_multipliers=rgb_multipliers, motion_threshold=motion_threshold,
 		chromatic_tail_only=chromatic_tail_only == 'true',
-		median_window=sliding_median_window)
+		median_window=sliding_median_window,
+		median_signed_color=sliding_median_signed_color)
 	frame_idx = 0
 	csv_file = open(os.path.join(output_folder, base + "_tracking.csv"), 'w', newline='')
 	csv_writer = csv.writer(csv_file)

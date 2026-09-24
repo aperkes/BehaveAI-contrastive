@@ -32,7 +32,8 @@ class MotionProcessor:
 	def __init__(self, history_frames=3, frame_gap=1, strategy='exponential',
 				 exp_a=0.5, exp_b=0.8, lum_weight=0.7,
 				 rgb_multipliers=(2, 2, 2), motion_threshold=0,
-				 chromatic_tail_only=False, median_window=50):
+				 chromatic_tail_only=False, median_window=50,
+				 median_signed_color=False):
 		self.history_frames = int(history_frames)
 		self.frame_gap = int(frame_gap)
 		if not 1 <= self.history_frames <= 3:
@@ -51,6 +52,7 @@ class MotionProcessor:
 		self.rgb_multipliers = tuple(float(x) for x in rgb_multipliers)
 		self.motion_threshold = float(motion_threshold)
 		self.chromatic_tail_only = bool(chromatic_tail_only)
+		self.median_signed_color = bool(median_signed_color)
 		self.reset()
 
 	def reset(self):
@@ -112,9 +114,14 @@ class MotionProcessor:
 				history.append(gray.copy())
 				return None
 			background = np.median(np.stack(history), axis=0).astype(np.uint8)
-			difference = cv2.absdiff(gray, background)
 			history.append(gray.copy())
-			channels = (difference, difference, difference)
+			if self.median_signed_color:
+				negative = cv2.subtract(background, gray)
+				positive = cv2.subtract(gray, background)
+				channels = (negative, np.zeros_like(gray), positive)
+			else:
+				difference = cv2.absdiff(gray, background)
+				channels = (difference, difference, difference)
 			return self._render(gray, channels)
 
 		previous = self._previous_by_phase.get(phase)

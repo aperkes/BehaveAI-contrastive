@@ -734,6 +734,12 @@ class SettingsEditorApp(tk.Tk):
 			tab2, from_=1, to=10000, textvariable=self.sliding_median_window_var,
 			width=8, command=self._set_dirty, state='disabled')
 		self.sliding_median_spinbox.grid(row=9, column=1, sticky='w', padx=8)
+		self.sliding_median_signed_color_var = tk.BooleanVar(value=False)
+		self.sliding_median_signed_color_check = ttk.Checkbutton(
+			tab2, text='Signed difference (positive red)',
+			variable=self.sliding_median_signed_color_var,
+			command=self._set_dirty, state='disabled')
+		self.sliding_median_signed_color_check.grid(row=10, column=0, columnspan=2, sticky='w', padx=8, pady=(6,0))
 		self.strategy_var.trace_add('write', self._on_motion_controls_changed)
 		self.motion_history_frames_var.trace_add('write', self._on_motion_controls_changed)
 
@@ -920,6 +926,7 @@ class SettingsEditorApp(tk.Tk):
 		# motion tab
 		self.strategy_var.set(d.get('strategy', fallback='exponential'))
 		self.sliding_median_window_var.set(int(d.get('sliding_median_window', fallback='50')))
+		self.sliding_median_signed_color_var.set(self._str_to_bool(d.get('sliding_median_signed_color', fallback='false')))
 		self.chromatic_tail_only_var.set(self._str_to_bool(d.get('chromatic_tail_only', fallback='false')))
 		self.expA_var.set(float(d.get('expA', fallback='0.5')))
 		self.expB_var.set(float(d.get('expB', fallback='0.7')))
@@ -934,6 +941,7 @@ class SettingsEditorApp(tk.Tk):
 		self._loaded_motion_settings = {
 			'strategy': str(d.get('strategy', fallback='sequential')),
 			'sliding_median_window': str(d.get('sliding_median_window', fallback='50')),
+			'sliding_median_signed_color': str(d.get('sliding_median_signed_color', fallback='false')).lower(),
 			'chromatic_tail_only': str(d.get('chromatic_tail_only', fallback='false')).lower(),
 			'expA': str(d.get('expA', fallback='0.5')),
 			'expB': str(d.get('expB', fallback='0.7')),
@@ -1081,6 +1089,7 @@ class SettingsEditorApp(tk.Tk):
 		curr = {
 			'strategy': str(self.strategy_var.get()),
 			'sliding_median_window': str(self.sliding_median_window_var.get()),
+			'sliding_median_signed_color': str(self.sliding_median_signed_color_var.get()).lower(),
 			'chromatic_tail_only': str(self.chromatic_tail_only_var.get()).lower(),
 			'expA': str(self.expA_var.get()),
 			'expB': str(self.expB_var.get()),
@@ -1275,6 +1284,7 @@ class SettingsEditorApp(tk.Tk):
 		# motion strategy
 		new_default['strategy'] = self.strategy_var.get()
 		new_default['sliding_median_window'] = str(self.sliding_median_window_var.get())
+		new_default['sliding_median_signed_color'] = str(self.sliding_median_signed_color_var.get()).lower()
 		new_default['chromatic_tail_only'] = str(self.chromatic_tail_only_var.get()).lower()
 		new_default['expA'] = str(self.expA_var.get())
 		new_default['expB'] = str(self.expB_var.get())
@@ -1459,7 +1469,8 @@ class SettingsEditorApp(tk.Tk):
 		exp_a_state = 'normal' if strategy == 'exponential' and history_frames > 1 else 'disabled'
 		exp_b_state = 'normal' if strategy == 'exponential' and history_frames > 2 else 'disabled'
 
-		set_state(median_state, self.sliding_median_label, self.sliding_median_spinbox)
+		set_state(median_state, self.sliding_median_label, self.sliding_median_spinbox,
+				  self.sliding_median_signed_color_check)
 		set_state(history_state, self.motion_history_frames_label, self.motion_history_frames_spinbox)
 		set_state(chromatic_state, self.chromatic_tail_only_check)
 		set_state(exp_a_state, self.expA_label, self.expA_spinbox)

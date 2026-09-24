@@ -184,6 +184,7 @@ try:
 	lum_weight = float(config['DEFAULT'].get('lum_weight', '0.7'))
 	strategy = config['DEFAULT'].get('strategy', 'exponential')
 	sliding_median_window = int(config['DEFAULT'].get('sliding_median_window', '50'))
+	sliding_median_signed_color = config['DEFAULT'].get('sliding_median_signed_color', 'false').lower() == 'true'
 	chromatic_tail_only = config['DEFAULT']['chromatic_tail_only'].lower()
 	primary_conf_thresh = float(config['DEFAULT'].get('primary_conf_thresh', '0.5'))
 	secondary_conf_thresh = float(config['DEFAULT'].get('secondary_conf_thresh', '0.5'))
@@ -2095,7 +2096,8 @@ class AnnotatorTk:
 					lum_weight=lum_weight, rgb_multipliers=rgb_multipliers,
 					motion_threshold=motion_threshold,
 					chromatic_tail_only=chromatic_tail_only == 'true',
-					median_window=sliding_median_window)
+					median_window=sliding_median_window,
+					median_signed_color=sliding_median_signed_color)
 				motion_image = None
 				raw_buf.clear()
 				total_to_read = (base_N - 1) * step + 1
