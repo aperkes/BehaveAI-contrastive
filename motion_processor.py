@@ -48,6 +48,32 @@ class MotionProcessor:
 		self._previous_by_phase = {}
 		self.last_motion_image = None
 
+	@staticmethod
+	def _one_frame_flow_channels(previous_gray, gray):
+		"""Return BGR motion layers with blue sources and red destinations."""
+		flow = cv2.calcOpticalFlowFarneback(
+			previous_gray, gray, None,
+			pyr_scale=0.5, levels=3, winsize=15, iterations=3,
+			poly_n=5, poly_sigma=1.2, flags=0)
+		magnitude = cv2.magnitude(flow[..., 0], flow[..., 1])
+		magnitude[magnitude < 0.1] = 0
+		gradient_x = cv2.Sobel(previous_gray, cv2.CV_32F, 1, 0, ksize=3)
+		gradient_y = cv2.Sobel(previous_gray, cv2.CV_32F, 0, 1, ksize=3)
+		edge_strength = cv2.magnitude(gradient_x, gradient_y)
+		strength = np.clip(edge_strength * np.minimum(magnitude, 1.0), 0, 255).astype(np.uint8)
+
+		# Dense flow is defined at the source (previous-frame) pixels. Keep those
+		# pixels blue, then forward-splat their strength to their destinations in red.
+		height, width = gray.shape
+		y, x = np.indices((height, width))
+		dest_x = np.rint(x + flow[..., 0]).astype(np.int32)
+		dest_y = np.rint(y + flow[..., 1]).astype(np.int32)
+		valid = ((strength > 0) & (dest_x >= 0) & (dest_x < width) &
+				 (dest_y >= 0) & (dest_y < height))
+		leading = np.zeros_like(strength)
+		np.maximum.at(leading, (dest_y[valid], dest_x[valid]), strength[valid])
+		return strength, np.zeros_like(strength), leading
+
 	def update(self, frame):
 		"""Consume one source frame and compare it with its same-gap history."""
 		phase = self._source_index % self.frame_gap
@@ -58,6 +84,7 @@ class MotionProcessor:
 			self._previous_by_phase[phase] = [gray.copy() for _ in range(self.history_frames)]
 			return None
 
+		previous_gray = previous[0]
 		diffs = [cv2.absdiff(item, gray) for item in previous]
 		if self.strategy == 'exponential':
 			previous[0] = gray
@@ -71,18 +98,17 @@ class MotionProcessor:
 			previous[0] = gray
 
 		if self.history_frames == 1:
-			diffs = [diffs[0], diffs[0], diffs[0]]
-		elif self.history_frames == 2:
-			diffs = [diffs[0], diffs[1], diffs[1]]
-
-		# A chromatic tail requires at least two different time histories.
-		if self.chromatic_tail_only and self.history_frames > 1:
-			tb = cv2.subtract(diffs[0], diffs[1])
-			tr = cv2.subtract(diffs[2], diffs[1])
-			tg = cv2.subtract(diffs[1], diffs[0])
-			channels = (tb, tg, tr)
+			channels = self._one_frame_flow_channels(previous_gray, gray)
 		else:
-			channels = tuple(diffs)
+			if self.history_frames == 2:
+				diffs = [diffs[0], diffs[1], diffs[1]]
+			if self.chromatic_tail_only:
+				tb = cv2.subtract(diffs[0], diffs[1])
+				tr = cv2.subtract(diffs[2], diffs[1])
+				tg = cv2.subtract(diffs[1], diffs[0])
+				channels = (tb, tg, tr)
+			else:
+				channels = tuple(diffs)
 
 		blue = cv2.addWeighted(gray, self.lum_weight, channels[0], self.rgb_multipliers[2], self.motion_threshold)
 		green = cv2.addWeighted(gray, self.lum_weight, channels[1], self.rgb_multipliers[1], self.motion_threshold)
