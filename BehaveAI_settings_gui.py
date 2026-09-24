@@ -689,15 +689,20 @@ class SettingsEditorApp(tk.Tk):
 		ttk.Combobox(tab2, values=['sequential', 'exponential', 'sliding_median'], textvariable=self.strategy_var, state='readonly').grid(row=0, column=1, sticky='w', padx=8, pady=(8,0))
 
 		self.chromatic_tail_only_var = tk.BooleanVar(value=False)
-		ttk.Checkbutton(tab2, text='Chromatic tail only', variable=self.chromatic_tail_only_var, command=self._set_dirty).grid(row=1, column=0, sticky='w', padx=8, pady=(6,0))
+		self.chromatic_tail_only_check = ttk.Checkbutton(tab2, text='Chromatic tail only', variable=self.chromatic_tail_only_var, command=self._set_dirty)
+		self.chromatic_tail_only_check.grid(row=1, column=0, sticky='w', padx=8, pady=(6,0))
 
-		ttk.Label(tab2, text='Green decay (expA)').grid(row=2, column=0, sticky='w', padx=8, pady=(6,0))
+		self.expA_label = ttk.Label(tab2, text='Green decay (expA)')
+		self.expA_label.grid(row=2, column=0, sticky='w', padx=8, pady=(6,0))
 		self.expA_var = tk.DoubleVar(value=0.5)
-		ttk.Spinbox(tab2, from_=0.0, to=0.99, increment=0.01, textvariable=self.expA_var, width=6, command=self._set_dirty).grid(row=2, column=1, sticky='w', padx=8)
+		self.expA_spinbox = ttk.Spinbox(tab2, from_=0.0, to=0.99, increment=0.01, textvariable=self.expA_var, width=6, command=self._set_dirty)
+		self.expA_spinbox.grid(row=2, column=1, sticky='w', padx=8)
 
-		ttk.Label(tab2, text='Red decay (expB)').grid(row=3, column=0, sticky='w', padx=8, pady=(6,0))
+		self.expB_label = ttk.Label(tab2, text='Red decay (expB)')
+		self.expB_label.grid(row=3, column=0, sticky='w', padx=8, pady=(6,0))
 		self.expB_var = tk.DoubleVar(value=0.8)
-		ttk.Spinbox(tab2, from_=0.0, to=0.99, increment=0.01, textvariable=self.expB_var, width=6, command=self._set_dirty).grid(row=3, column=1, sticky='w', padx=8)
+		self.expB_spinbox = ttk.Spinbox(tab2, from_=0.0, to=0.99, increment=0.01, textvariable=self.expB_var, width=6, command=self._set_dirty)
+		self.expB_spinbox.grid(row=3, column=1, sticky='w', padx=8)
 
 		ttk.Label(tab2, text='Lum weight').grid(row=4, column=0, sticky='w', padx=8, pady=(6,0))
 		self.lum_weight_var = tk.DoubleVar(value=0.5)
@@ -712,9 +717,11 @@ class SettingsEditorApp(tk.Tk):
 		self.frame_skip_var = tk.IntVar(value=0)
 		ttk.Spinbox(tab2, from_=0, to=10000, textvariable=self.frame_skip_var, width=8, command=self._set_dirty).grid(row=6, column=1, sticky='w', padx=8)
 
-		ttk.Label(tab2, text='Motion history frames').grid(row=7, column=0, sticky='w', padx=8, pady=(6,0))
+		self.motion_history_frames_label = ttk.Label(tab2, text='Motion history frames')
+		self.motion_history_frames_label.grid(row=7, column=0, sticky='w', padx=8, pady=(6,0))
 		self.motion_history_frames_var = tk.IntVar(value=3)
-		ttk.Spinbox(tab2, from_=1, to=3, textvariable=self.motion_history_frames_var, width=8, command=self._set_dirty).grid(row=7, column=1, sticky='w', padx=8)
+		self.motion_history_frames_spinbox = ttk.Spinbox(tab2, from_=1, to=3, textvariable=self.motion_history_frames_var, width=8, command=self._set_dirty)
+		self.motion_history_frames_spinbox.grid(row=7, column=1, sticky='w', padx=8)
 
 		ttk.Label(tab2, text='Motion frame gap').grid(row=8, column=0, sticky='w', padx=8, pady=(6,0))
 		self.motion_frame_gap_var = tk.IntVar(value=1)
@@ -727,7 +734,8 @@ class SettingsEditorApp(tk.Tk):
 			tab2, from_=1, to=10000, textvariable=self.sliding_median_window_var,
 			width=8, command=self._set_dirty, state='disabled')
 		self.sliding_median_spinbox.grid(row=9, column=1, sticky='w', padx=8)
-		self.strategy_var.trace_add('write', self._on_motion_strategy_changed)
+		self.strategy_var.trace_add('write', self._on_motion_controls_changed)
+		self.motion_history_frames_var.trace_add('write', self._on_motion_controls_changed)
 
 		# TAB 3: Model type
 		tab3 = ttk.Frame(notebook)
@@ -1434,10 +1442,28 @@ class SettingsEditorApp(tk.Tk):
 		if self.dirty:
 			self.save_btn.config(state='normal')
 
-	def _on_motion_strategy_changed(self, *_args):
-		state = 'normal' if self.strategy_var.get() == 'sliding_median' else 'disabled'
-		self.sliding_median_spinbox.configure(state=state)
-		self.sliding_median_label.configure(state=state)
+	def _on_motion_controls_changed(self, *_args):
+		strategy = self.strategy_var.get()
+		try:
+			history_frames = self.motion_history_frames_var.get()
+		except tk.TclError:
+			history_frames = 3
+
+		def set_state(state, *widgets):
+			for widget in widgets:
+				widget.configure(state=state)
+
+		median_state = 'normal' if strategy == 'sliding_median' else 'disabled'
+		history_state = 'disabled' if strategy == 'sliding_median' else 'normal'
+		chromatic_state = 'normal' if strategy != 'sliding_median' and history_frames > 1 else 'disabled'
+		exp_a_state = 'normal' if strategy == 'exponential' and history_frames > 1 else 'disabled'
+		exp_b_state = 'normal' if strategy == 'exponential' and history_frames > 2 else 'disabled'
+
+		set_state(median_state, self.sliding_median_label, self.sliding_median_spinbox)
+		set_state(history_state, self.motion_history_frames_label, self.motion_history_frames_spinbox)
+		set_state(chromatic_state, self.chromatic_tail_only_check)
+		set_state(exp_a_state, self.expA_label, self.expA_spinbox)
+		set_state(exp_b_state, self.expB_label, self.expB_spinbox)
 		self._set_dirty()
 
 if __name__ == "__main__":
