@@ -301,6 +301,17 @@ grey_boxes = []
 original_frame = None
 fr = None
 motion_image = None
+cached_median_processor = None
+cached_median_frame = None
+
+
+def print_median_progress(percent, label):
+	"""Emit a launcher-console progress line that overwrites itself."""
+	percent = max(0, min(100, int(percent)))
+	width = 20
+	filled = int(round(width * percent / 100.0))
+	bar = '#' * filled + '-' * (width - filled)
+	print(f"{percent:3d}% |{bar}| {label}", end='\n' if percent == 100 else '\r', flush=True)
 
 video_label = os.path.splitext(os.path.basename(video_path))[0]
 
@@ -2029,6 +2040,7 @@ class AnnotatorTk:
 
 	def _loop_body(self):
 		global frame_updated, fr, original_frame, motion_image, raw_buf, last_mouse_move, last_anim_draw, boxes, grey_boxes
+		global cached_median_processor, cached_median_frame
 
 		need_ = False
 		now = time.time()
@@ -2042,16 +2054,43 @@ class AnnotatorTk:
 			step = motion_frame_gap
 			base_N = raw_buf.maxlen
 			start_frame = last_frame - (base_N - 1) * step
+			fast_median_step = (
+				strategy == 'sliding_median' and step == 1 and
+				cached_median_processor is not None and
+				cached_median_frame is not None and
+				last_frame == cached_median_frame + 1)
+
+			if fast_median_step:
+				if int(capture.get(cv2.CAP_PROP_POS_FRAMES)) != last_frame:
+					capture.set(cv2.CAP_PROP_POS_FRAMES, last_frame)
+				ret, raw_frame = capture.read()
+				if ret:
+					fr = raw_frame.copy()
+					if scale_factor != 1.0:
+						fr = cv2.resize(fr, (0,0), fx=scale_factor, fy=scale_factor)
+					print_median_progress(90, "Calculating median background")
+					motion_image = cached_median_processor.update(fr)
+					raw_buf.append(fr.copy())
+					cached_median_frame = last_frame
+					print_median_progress(100, "Motion image ready")
+				else:
+					fast_median_step = False
+					cached_median_processor = None
+					cached_median_frame = None
+
 			if start_frame < 0:
 				original_frame = np.zeros((video_height, video_width, 3), dtype=np.uint8)
 				fr = original_frame.copy()
 				motion_image = original_frame.copy()
 				raw_buf.clear()
+				cached_median_processor = None
+				cached_median_frame = None
 				need_ = True
-			else:
+			elif not fast_median_step:
 				capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+				processor_frame_gap = 1 if strategy == 'sliding_median' else step
 				motion_processor = MotionProcessor(
-					history_frames=motion_history_frames, frame_gap=step,
+					history_frames=motion_history_frames, frame_gap=processor_frame_gap,
 					strategy=strategy, exp_a=expA, exp_b=expB,
 					lum_weight=lum_weight, rgb_multipliers=rgb_multipliers,
 					motion_threshold=motion_threshold,
@@ -2059,36 +2098,61 @@ class AnnotatorTk:
 					median_window=sliding_median_window)
 				motion_image = None
 				raw_buf.clear()
-				for i in range((base_N - 1) * step + 1):
+				total_to_read = (base_N - 1) * step + 1
+				for i in range(total_to_read):
 					ret, raw_frame = capture.read()
 					if not ret:
 						break
+					is_sample = i % step == 0
+					if strategy == 'sliding_median' and i < total_to_read - 1:
+						percent = int(85 * (i + 1) / max(1, total_to_read - 1))
+						print_median_progress(percent, "Loading median history")
+					if strategy == 'sliding_median' and not is_sample:
+						continue
 					fr = raw_frame.copy()
 					if scale_factor != 1.0:
 						fr = cv2.resize(fr, (0,0), fx=scale_factor, fy=scale_factor)
-					candidate = motion_processor.update(fr)
-					if i % step == 0:
+					if strategy == 'sliding_median' and i < total_to_read - 1:
+						motion_processor.prime(fr)
+						candidate = None
+					else:
+						if strategy == 'sliding_median':
+							print_median_progress(90, "Calculating median background")
+						candidate = motion_processor.update(fr)
+					if is_sample:
 						raw_buf.append(fr.copy())
 					if candidate is not None:
 						motion_image = candidate
+				if strategy == 'sliding_median':
+					print_median_progress(100, "Motion image ready")
+				if strategy == 'sliding_median' and step == 1 and motion_image is not None:
+					cached_median_processor = motion_processor
+					cached_median_frame = last_frame
+				else:
+					cached_median_processor = None
+					cached_median_frame = None
+
 				if motion_image is not None:
 					original_frame = motion_image.copy()
-					
 
-					try:
-						base = f"{video_label}_{frame_number}"
-						boxes, grey_boxes = annotation_index.load_labels_for_basename(base, fr, original_frame)
-					except Exception as e:
-						print("Error loading saved annotations for", f"{video_label}_{frame_number},", e)
-				
-					if boxes or grey_boxes:
-						# ~ print('Annotations found')
-						pass
-					else:
-						if auto_ann_switch == 1:
-							auto_annotate_local()
-						need_ = True
-						last_anim_draw = time.time()
+			if fast_median_step and motion_image is not None:
+				original_frame = motion_image.copy()
+
+			if start_frame >= 0 and motion_image is not None:
+				try:
+					base = f"{video_label}_{frame_number}"
+					boxes, grey_boxes = annotation_index.load_labels_for_basename(base, fr, original_frame)
+				except Exception as e:
+					print("Error loading saved annotations for", f"{video_label}_{frame_number},", e)
+
+				if boxes or grey_boxes:
+					# ~ print('Annotations found')
+					pass
+				else:
+					if auto_ann_switch == 1:
+						auto_annotate_local()
+					need_ = True
+					last_anim_draw = time.time()
 					
 		else:
 			if (now - last_mouse_move) > ANIM_STILL_THRESHOLD and (now - last_anim_draw) >= ANIM_DT:

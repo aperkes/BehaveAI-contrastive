@@ -59,6 +59,19 @@ class MotionProcessor:
 		self._median_frames_by_phase = {}
 		self.last_motion_image = None
 
+	def prime(self, frame):
+		"""Add a frame to a sliding-median history without calculating an image."""
+		if self.strategy != 'sliding_median':
+			raise ValueError("prime() is only available for the sliding_median strategy")
+		phase = self._source_index % self.frame_gap
+		self._source_index += 1
+		gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+		history = self._median_frames_by_phase.get(phase)
+		if history is None:
+			history = deque(maxlen=self.median_window)
+			self._median_frames_by_phase[phase] = history
+		history.append(gray.copy())
+
 	@staticmethod
 	def _one_frame_flow_channels(previous_gray, gray):
 		"""Return BGR motion layers with blue sources and red destinations."""
@@ -148,6 +161,24 @@ class MotionProcessor:
 def build_motion_image(frames, **kwargs):
 	"""Build the final motion image from a contiguous iterable of source frames."""
 	processor = MotionProcessor(**kwargs)
+	if processor.strategy == 'sliding_median':
+		frame_gap = processor.frame_gap
+		# Only the phase ending at the requested final frame contributes to that
+		# image. Feeding other phases wastes both memory and median-history work.
+		processor.frame_gap = 1
+		iterator = iter(frames)
+		try:
+			pending = next(iterator)
+		except StopIteration:
+			return None
+		index = 0
+		for frame in iterator:
+			if index % frame_gap == 0:
+				processor.prime(pending)
+			pending = frame
+			index += 1
+		return processor.update(pending)
+
 	result = None
 	for frame in frames:
 		candidate = processor.update(frame)
