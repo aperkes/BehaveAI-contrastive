@@ -531,6 +531,8 @@ class KalmanTracker:
             # try to find an existing track under the threshold
             best_tid, best_dist = None, float('inf')
             for tid, (px, py) in preds:
+                if tid in matched_tracks:
+                    continue
                 d = np.hypot(dpt[0]-px, dpt[1]-py)
                 if d < best_dist:
                     best_dist, best_tid = d, tid
