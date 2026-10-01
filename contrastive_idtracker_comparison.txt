@@ -65,16 +65,23 @@ Crop handling:
   also supported.
 
 Clustering and assignment:
-* Euclidean K-means operates on direct ResNet outputs. The legacy model retains
-  cosine K-means and normalized track embeddings.
-* Detection embeddings then vote for a fragment-level identity distribution.
-* A complete coexisting track group initializes and anchors cluster identities
-  when all member tracks meet the minimum length.
+* Euclidean K-means operates on the individual crop embeddings retained by the
+  conservative fragment filter, rather than on means of the original BehaveAI
+  tracks. The legacy model retains cosine K-means.
+* Detection embeddings then vote for the identity of each conservative
+  fragment. One original BehaveAI track may therefore receive different
+  identities on opposite sides of an uncertain crossing instead of propagating
+  a mistaken handoff through the entire source track.
+* A complete coexisting group of safe fragments initializes and anchors cluster
+  identities when all member fragments meet the minimum length. Only the clean
+  coexisting portion contributes to each initialization center.
 * Fragment probabilities are corrected using coexisting fragments, following
   the basic idtracker.ai P1/P2 idea.
-* Fragments are assigned in confidence order.
-* Ambiguous or structurally impossible fragments are assigned -1 rather than
-  forcing an identity collision.
+* Fragments are assigned in confidence order while identities already used by
+  coexisting fragments are unavailable. A final hard check guarantees that an
+  identity appears no more than once in any frame.
+* Detections excluded around ambiguous crossings and structurally impossible
+  fragments are assigned -1 rather than forcing an identity collision.
 * Original unconstrained K-means remains available as a comparison backend.
 
 

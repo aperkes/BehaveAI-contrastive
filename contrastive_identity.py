@@ -2018,7 +2018,12 @@ def cosine_kmeans(
 
 
 def euclidean_kmeans(
-    vectors, number_of_individuals, seed, initial_centers=None, restarts=20
+    vectors,
+    number_of_individuals,
+    seed,
+    initial_centers=None,
+    restarts=20,
+    max_iterations=200,
 ):
     """Dependency-free Euclidean K-means for idTracker network outputs."""
     vectors = np.asarray(vectors, dtype=np.float32)
@@ -2045,7 +2050,7 @@ def euclidean_kmeans(
                     chosen.append(int(generator.choice(len(vectors), p=weights / weights.sum())))
             centers = vectors[chosen].copy()
         assignments = np.full(len(vectors), -1, dtype=np.int64)
-        for _ in range(200):
+        for _ in range(max_iterations):
             squared = ((vectors[:, None] - centers[None]) ** 2).sum(axis=2)
             updated = squared.argmin(axis=1)
             if np.array_equal(updated, assignments):
@@ -2073,29 +2078,34 @@ def cluster_identities(track_embeddings, number_of_individuals, seed, metric="co
     return assignments
 
 
-def find_reference_global_fragment(
+def find_reference_training_fragments(
     detections,
-    track_to_label,
+    fragments,
     number_of_individuals,
     minimum_frames,
 ):
-    """Return the strongest full-animal group whose tracks are long enough."""
-    tracks_by_frame = defaultdict(set)
-    track_lengths = defaultdict(int)
-    for item in detections:
-        label = track_to_label[item.track_key]
-        tracks_by_frame[(item.video, item.frame)].add(label)
-        track_lengths[label] += 1
+    """Find a complete coexisting group among conservative fragments."""
+    detection_to_fragment = np.full(len(detections), -1, dtype=np.int64)
+    fragment_lengths = np.zeros(len(fragments.keys), dtype=np.int64)
+    for fragment, indices in fragments.indices_by_fragment.items():
+        detection_to_fragment[indices] = fragment
+        fragment_lengths[fragment] = len(indices)
+
+    fragments_by_frame = defaultdict(set)
+    for index, item in enumerate(detections):
+        fragment = detection_to_fragment[index]
+        if fragment >= 0:
+            fragments_by_frame[(item.video, item.frame)].add(int(fragment))
 
     frames_by_group = defaultdict(list)
-    for frame_key, labels in tracks_by_frame.items():
+    for (video, frame), labels in fragments_by_frame.items():
         if len(labels) == number_of_individuals:
-            frames_by_group[(frame_key[0], tuple(sorted(labels)))].append(frame_key[1])
+            frames_by_group[(video, tuple(sorted(labels)))].append(frame)
 
     candidates = [
         (key, frames)
         for key, frames in frames_by_group.items()
-        if min(track_lengths[label] for label in key[1]) >= minimum_frames
+        if min(fragment_lengths[label] for label in key[1]) >= minimum_frames
     ]
     if not candidates:
         return None
@@ -2103,14 +2113,17 @@ def find_reference_global_fragment(
         candidates,
         key=lambda item: (
             len(item[1]),
-            min(track_lengths[label] for label in item[0][1]),
+            min(fragment_lengths[label] for label in item[0][1]),
         ),
     )
     return {
         "video": video,
-        "track_labels": labels,
+        "fragment_labels": labels,
+        "coexisting_frames": tuple(frames),
         "coexisting_frame_count": len(frames),
-        "minimum_track_detections": min(track_lengths[label] for label in labels),
+        "minimum_fragment_detections": int(
+            min(fragment_lengths[label] for label in labels)
+        ),
         "first_frame": min(frames),
         "last_frame": max(frames),
     }
@@ -2132,53 +2145,158 @@ def fragment_identity_probabilities(
     return probabilities
 
 
-def assign_with_cooccurrence(p1, known_different, fixed_assignments=None):
-    """Assign fragments in confidence order while enforcing temporal exclusivity."""
+def assign_fragments_with_cooccurrence(p1, known_different, fixed_assignments=None):
+    """Assign fragments efficiently while forbidding coexisting duplicates."""
     p1 = np.asarray(p1, dtype=np.float64).copy()
-    track_count, number_of_individuals = p1.shape
-    assignments = np.full(track_count, -1, dtype=np.int64)
-    confidences = np.zeros(track_count, dtype=np.float64)
-    remaining = set(range(track_count))
+    fragment_count, number_of_individuals = p1.shape
+    fixed_assignments = fixed_assignments or {}
+    for fragment, identity in fixed_assignments.items():
+        p1[fragment] = 0.0
+        p1[fragment, identity] = 1.0
 
-    for track, identity in (fixed_assignments or {}).items():
-        assignments[track] = identity
-        confidences[track] = 1.0
-        p1[track] = 0.0
-        p1[track, identity] = 1.0
-        remaining.discard(track)
+    # idtracker.ai's P2 combines each fragment's image evidence with evidence
+    # that coexisting fragments are not a given identity.  Calculate it once;
+    # repeatedly recalculating every row is prohibitively expensive for the
+    # thousands of conservative fragments in a long video.
+    p2 = np.empty_like(p1)
+    for fragment in range(fragment_count):
+        neighbors = np.flatnonzero(known_different[fragment])
+        if len(neighbors):
+            log_scores = np.log(np.clip(p1[fragment], 1e-300, 1.0))
+            log_scores += np.log(
+                np.clip(1.0 - p1[neighbors], 1e-300, 1.0)
+            ).sum(axis=0)
+            log_scores -= log_scores.max()
+            scores = np.exp(log_scores)
+        else:
+            scores = p1[fragment].copy()
+        total = scores.sum()
+        p2[fragment] = scores / total if total else p1[fragment]
 
-    while remaining:
-        best = None
-        for track in remaining:
-            neighbors = np.flatnonzero(known_different[track])
-            if len(neighbors):
-                adjusted = p1[track] * np.prod(1.0 - p1[neighbors], axis=0)
-            else:
-                adjusted = p1[track].copy()
-            total = adjusted.sum()
-            if total > 0:
-                adjusted /= total
-            ordered = np.sort(adjusted)
-            certainty = (
-                np.inf
-                if number_of_individuals == 1 or ordered[-2] == 0 < ordered[-1]
-                else (ordered[-1] / ordered[-2] if ordered[-2] > 0 else 0.0)
-            )
-            candidate = (certainty, float(adjusted.max()), -track, track, adjusted)
-            if best is None or candidate[:3] > best[:3]:
-                best = candidate
+    assignments = np.full(fragment_count, -1, dtype=np.int64)
+    confidences = np.zeros(fragment_count, dtype=np.float64)
+    for fragment, identity in fixed_assignments.items():
+        assignments[fragment] = identity
+        confidences[fragment] = 1.0
 
-        _, max_probability, _, track, adjusted = best
-        winners = np.flatnonzero(np.isclose(adjusted, max_probability))
-        if max_probability > 0 and len(winners) == 1:
-            identity = int(winners[0])
-            assignments[track] = identity
-            confidences[track] = max_probability
-            p1[track] = 0.0
-            p1[track, identity] = 1.0
-        remaining.remove(track)
+    sorted_probabilities = np.sort(p2, axis=1)
+    if number_of_individuals == 1:
+        certainty = sorted_probabilities[:, -1]
+    else:
+        certainty = sorted_probabilities[:, -1] / np.maximum(
+            sorted_probabilities[:, -2], 1e-300
+        )
+    order = sorted(
+        (fragment for fragment in range(fragment_count) if fragment not in fixed_assignments),
+        key=lambda fragment: (-certainty[fragment], -p2[fragment].max(), fragment),
+    )
+    for fragment in order:
+        neighbors = np.flatnonzero(known_different[fragment])
+        forbidden = set(assignments[neighbors][assignments[neighbors] >= 0].tolist())
+        available = np.asarray(
+            [identity for identity in range(number_of_individuals) if identity not in forbidden],
+            dtype=np.int64,
+        )
+        if not len(available):
+            continue
+        scores = p2[fragment, available]
+        identity = int(available[np.argmax(scores)])
+        assignments[fragment] = identity
+        confidences[fragment] = float(p2[fragment, identity])
 
-    return assignments, confidences
+    return assignments, confidences, p2
+
+
+def conservative_fragment_identity_assignment(
+    embeddings,
+    detections,
+    fragments,
+    number_of_individuals,
+    seed,
+    global_fragment_min_frames,
+    metric="euclidean",
+):
+    """Cluster safe crop embeddings and vote identities per safe fragment."""
+    detection_fragments = np.full(len(detections), -1, dtype=np.int64)
+    for fragment, indices in fragments.indices_by_fragment.items():
+        detection_fragments[indices] = fragment
+    safe_indices = np.flatnonzero(detection_fragments >= 0)
+    if len(safe_indices) < number_of_individuals:
+        raise ValueError(
+            "Too few detections survived conservative fragment filtering to "
+            "form the requested identity clusters."
+        )
+
+    reference = find_reference_training_fragments(
+        detections,
+        fragments,
+        number_of_individuals,
+        global_fragment_min_frames,
+    )
+    initial_centers = None
+    fixed_assignments = {}
+    if reference is not None:
+        reference_frames = set(reference["coexisting_frames"])
+        centers = []
+        for identity, fragment in enumerate(reference["fragment_labels"]):
+            indices = [
+                index
+                for index in fragments.indices_by_fragment[fragment]
+                if detections[index].frame in reference_frames
+            ]
+            if not indices:
+                indices = fragments.indices_by_fragment[fragment]
+            if len(indices) > 500:
+                positions = np.linspace(0, len(indices) - 1, 500, dtype=np.int64)
+                indices = np.asarray(indices)[positions]
+            centers.append(embeddings[indices].mean(axis=0))
+            fixed_assignments[fragment] = identity
+        initial_centers = np.asarray(centers, dtype=np.float32)
+
+    safe_embeddings = embeddings[safe_indices]
+    if metric == "euclidean":
+        detection_clusters, _, _ = euclidean_kmeans(
+            safe_embeddings,
+            number_of_individuals,
+            seed,
+            initial_centers=initial_centers,
+            restarts=5,
+            max_iterations=50,
+        )
+    else:
+        detection_clusters, _, _ = cosine_kmeans(
+            safe_embeddings,
+            number_of_individuals,
+            seed,
+            initial_centers=initial_centers,
+            restarts=5,
+        )
+    p1 = fragment_identity_probabilities(
+        detection_clusters,
+        detection_fragments[safe_indices],
+        len(fragments.keys),
+        number_of_individuals,
+    )
+    assignments, confidences, p2 = assign_fragments_with_cooccurrence(
+        p1, fragments.known_different, fixed_assignments
+    )
+    assignments, confidences, demoted = enforce_identity_exclusivity(
+        assignments, confidences, fragments.known_different
+    )
+    if demoted:
+        print(
+            f"Final identity-exclusivity guard demoted {len(demoted)} conflicting "
+            "training fragments to -1."
+        )
+
+    detection_identities = np.full(len(detections), -1, dtype=np.int64)
+    assigned_safe = assignments[detection_fragments[safe_indices]]
+    detection_identities[safe_indices] = assigned_safe
+    if reference is not None:
+        reference = dict(reference)
+        reference.pop("coexisting_frames")
+        reference["fragment_labels"] = list(reference["fragment_labels"])
+    return assignments, confidences, p1, p2, reference, detection_identities
 
 
 def enforce_identity_exclusivity(assignments, confidences, known_different):
@@ -2204,74 +2322,6 @@ def enforce_identity_exclusivity(assignments, confidences, known_different):
         same_identity = assignments[conflicts] == assignments[first]
         assert not known_different[first, conflicts[same_identity]].any()
     return assignments, confidences, demoted
-
-
-def idtracker_identity_assignment(
-    embeddings,
-    track_embeddings,
-    detections,
-    track_to_label,
-    known_different,
-    number_of_individuals,
-    seed,
-    global_fragment_min_frames,
-    metric="cosine",
-):
-    """Cluster detections, then assign whole fragments using video constraints."""
-    reference = find_reference_global_fragment(
-        detections,
-        track_to_label,
-        number_of_individuals,
-        global_fragment_min_frames,
-    )
-    initial_centers = None
-    fixed_assignments = {}
-    if reference is not None:
-        initial_centers = track_embeddings[list(reference["track_labels"])]
-        fixed_assignments = {
-            track: identity
-            for identity, track in enumerate(reference["track_labels"])
-        }
-
-    if metric == "euclidean":
-        _, centers, _ = euclidean_kmeans(
-            track_embeddings,
-            number_of_individuals,
-            seed,
-            initial_centers=initial_centers,
-        )
-        detection_assignments = (
-            (embeddings[:, None] - centers[None]) ** 2
-        ).sum(axis=2).argmin(axis=1)
-    else:
-        _, centers, _ = cosine_kmeans(
-            track_embeddings,
-            number_of_individuals,
-            seed,
-            initial_centers=initial_centers,
-        )
-        detection_assignments = (_normalize_rows(embeddings) @ centers.T).argmax(axis=1)
-    detection_track_labels = np.asarray(
-        [track_to_label[item.track_key] for item in detections], dtype=np.int64
-    )
-    p1 = fragment_identity_probabilities(
-        detection_assignments,
-        detection_track_labels,
-        len(track_embeddings),
-        number_of_individuals,
-    )
-    assignments, confidences = assign_with_cooccurrence(
-        p1, known_different, fixed_assignments
-    )
-    assignments, confidences, demoted = enforce_identity_exclusivity(
-        assignments, confidences, known_different
-    )
-    if demoted:
-        print(
-            f"Final identity-exclusivity guard demoted {len(demoted)} conflicting "
-            "track fragments to -1."
-        )
-    return assignments, confidences, p1, reference
 
 
 def project_embeddings(
@@ -2348,6 +2398,20 @@ def write_identity_rows(path, raw_rows, detections, track_to_label, identity_by_
             writer.writerow(output)
 
 
+def write_detection_identity_rows(path, raw_rows, detection_identities):
+    """Write identities that may change between fragments of one source track."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(raw_rows[0]) + ["predicted_identity"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row, identity in zip(raw_rows, detection_identities):
+            output = dict(row)
+            output["predicted_identity"] = int(identity)
+            writer.writerow(output)
+
+
 def write_latents(
     path,
     embeddings,
@@ -2356,12 +2420,13 @@ def write_latents(
     identity_by_track=None,
     projection=None,
     projection_name=None,
+    identity_by_detection=None,
 ):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     coordinate_names = [f"latent_{index:03d}" for index in range(embeddings.shape[1])]
     fields = ["source_video", "frame", "track_id", "x1", "y1", "x2", "y2"]
-    if identity_by_track is not None:
+    if identity_by_track is not None or identity_by_detection is not None:
         fields.append("predicted_identity")
     if projection is not None:
         fields.extend(
@@ -2374,7 +2439,9 @@ def write_latents(
         writer.writerow(fields)
         for index, (vector, item) in enumerate(zip(embeddings, detections)):
             row = [item.video, item.frame, item.track_id, *item.bbox]
-            if identity_by_track is not None:
+            if identity_by_detection is not None:
+                row.append(int(identity_by_detection[index]))
+            elif identity_by_track is not None:
                 row.append(int(identity_by_track[track_to_label[item.track_key]]))
             if projection is not None:
                 row.extend(f"{value:.8g}" for value in projection[index])
@@ -2450,6 +2517,48 @@ def write_assignment_diagnostics(
             writer.writerow(row)
 
 
+def write_fragment_assignment_diagnostics(
+    path,
+    fragments,
+    detections,
+    assignments,
+    confidences,
+    p1,
+    p2,
+):
+    path = Path(path)
+    fields = [
+        "training_fragment",
+        "source_video",
+        "source_track_id",
+        "first_frame",
+        "last_frame",
+        "detection_count",
+        "predicted_identity",
+        "assignment_confidence",
+    ]
+    fields.extend(f"p1_cluster_probability_{index}" for index in range(p1.shape[1]))
+    fields.extend(f"p2_identity_probability_{index}" for index in range(p2.shape[1]))
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(fields)
+        for fragment, indices in fragments.indices_by_fragment.items():
+            video, track_id = fragments.original_track_by_fragment[fragment]
+            row = [
+                fragment,
+                video,
+                track_id,
+                detections[indices[0]].frame,
+                detections[indices[-1]].frame,
+                len(indices),
+                int(assignments[fragment]),
+                f"{confidences[fragment]:.8g}",
+            ]
+            row.extend(f"{value:.8g}" for value in p1[fragment])
+            row.extend(f"{value:.8g}" for value in p2[fragment])
+            writer.writerow(row)
+
+
 def assignment_quality(detections, track_to_label, assignments, confidences, reference):
     tracks_by_frame = defaultdict(set)
     for item in detections:
@@ -2489,6 +2598,59 @@ def assignment_quality(detections, track_to_label, assignments, confidences, ref
     }
 
 
+def fragment_assignment_quality(
+    detections,
+    fragments,
+    assignments,
+    confidences,
+    reference,
+    detection_identities,
+):
+    identities_by_frame = defaultdict(list)
+    for item, identity in zip(detections, detection_identities):
+        if identity >= 0:
+            identities_by_frame[(item.video, item.frame)].append(int(identity))
+
+    detections_by_frame = defaultdict(int)
+    for item in detections:
+        detections_by_frame[(item.video, item.frame)] += 1
+    multi_frames = sum(count >= 2 for count in detections_by_frame.values())
+    # Keep the key available while checking all multi-detection frames, including
+    # frames where only one safe fragment retained an identity.
+    collision_frames = 0
+    for frame_key, count in detections_by_frame.items():
+        if count < 2:
+            continue
+        identities = identities_by_frame.get(frame_key, [])
+        if len(identities) != len(set(identities)):
+            collision_frames += 1
+
+    assigned = assignments >= 0
+    assigned_detection_count = int((detection_identities >= 0).sum())
+    return {
+        "original_track_count": int(len({item.track_key for item in detections})),
+        "fragment_count": int(len(assignments)),
+        "assigned_fragments": int(assigned.sum()),
+        "unassigned_fragments": int((~assigned).sum()),
+        "assigned_fragment_fraction": float(assigned.mean()),
+        "detection_count": int(len(detections)),
+        "assigned_detections": assigned_detection_count,
+        "unassigned_detections": int(len(detections) - assigned_detection_count),
+        "assigned_detection_fraction": float(
+            assigned_detection_count / len(detections)
+        ),
+        "mean_assigned_confidence": (
+            float(confidences[assigned].mean()) if assigned.any() else 0.0
+        ),
+        "multi_detection_frames": int(multi_frames),
+        "identity_collision_frames": int(collision_frames),
+        "identity_collision_frame_fraction": (
+            float(collision_frames / multi_frames) if multi_frames else 0.0
+        ),
+        "reference_global_fragment": reference,
+    }
+
+
 def run_inference(
     args,
     model,
@@ -2499,8 +2661,9 @@ def run_inference(
     device,
     background_store,
     preloaded_crop_store,
+    training_fragments,
 ):
-    track_keys, track_to_label, _, known_different = metadata
+    track_keys, track_to_label, _, _ = metadata
     embeddings = extract_embeddings(
         args,
         model,
@@ -2521,33 +2684,42 @@ def run_inference(
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     identity_by_track = None
+    identity_by_detection = None
     if args.mode != "embed":
         if args.num_individuals is None:
             raise ValueError("--num-individuals is required when predicting identities.")
         if args.identity_assignment == "idtracker":
-            identity_by_track, assignment_confidence, p1, reference = (
-                idtracker_identity_assignment(
-                    embeddings,
-                    track_embeddings,
-                    detections,
-                    track_to_label,
-                    known_different,
-                    args.num_individuals,
-                    args.seed,
-                    args.global_fragment_min_frames,
-                    metric,
+            if training_fragments is None:
+                raise ValueError(
+                    "Conservative fragment metadata is required for idtracker "
+                    "identity assignment."
                 )
+            (
+                identity_by_fragment,
+                assignment_confidence,
+                p1,
+                p2,
+                reference,
+                identity_by_detection,
+            ) = conservative_fragment_identity_assignment(
+                embeddings,
+                detections,
+                training_fragments,
+                args.num_individuals,
+                args.seed,
+                args.global_fragment_min_frames,
+                metric,
             )
             if reference is None:
                 print(
-                    "No sufficiently large full-animal frame group was found; "
+                    "No sufficiently large full-animal safe-fragment group was found; "
                     "using K-means++ initialization with co-occurrence-aware assignment."
                 )
             else:
                 print(
-                    "Initialized identities from a reference group containing "
-                    "all animals; its shortest track has "
-                    f"{reference['minimum_track_detections']} detections."
+                    "Initialized identities from a safe reference group containing "
+                    "all animals; its shortest fragment has "
+                    f"{reference['minimum_fragment_detections']} detections."
                 )
         else:
             identity_by_track = cluster_identities(
@@ -2557,25 +2729,48 @@ def run_inference(
             p1 = None
             reference = None
         identity_path = output_dir / "identity_predictions.csv"
-        write_identity_rows(
-            identity_path, raw_rows, detections, track_to_label, identity_by_track
-        )
-        diagnostics_path = output_dir / "identity_assignment_tracks.csv"
-        write_assignment_diagnostics(
-            diagnostics_path,
-            track_keys,
-            track_counts,
-            identity_by_track,
-            assignment_confidence,
-            p1,
-        )
-        quality = assignment_quality(
-            detections,
-            track_to_label,
-            identity_by_track,
-            assignment_confidence,
-            reference,
-        )
+        if args.identity_assignment == "idtracker":
+            write_detection_identity_rows(
+                identity_path, raw_rows, identity_by_detection
+            )
+            diagnostics_path = output_dir / "identity_assignment_fragments.csv"
+            write_fragment_assignment_diagnostics(
+                diagnostics_path,
+                training_fragments,
+                detections,
+                identity_by_fragment,
+                assignment_confidence,
+                p1,
+                p2,
+            )
+            quality = fragment_assignment_quality(
+                detections,
+                training_fragments,
+                identity_by_fragment,
+                assignment_confidence,
+                reference,
+                identity_by_detection,
+            )
+        else:
+            write_identity_rows(
+                identity_path, raw_rows, detections, track_to_label, identity_by_track
+            )
+            diagnostics_path = output_dir / "identity_assignment_tracks.csv"
+            write_assignment_diagnostics(
+                diagnostics_path,
+                track_keys,
+                track_counts,
+                identity_by_track,
+                assignment_confidence,
+                p1,
+            )
+            quality = assignment_quality(
+                detections,
+                track_to_label,
+                identity_by_track,
+                assignment_confidence,
+                reference,
+            )
         quality["assignment_method"] = args.identity_assignment
         quality_path = output_dir / "identity_assignment_quality.json"
         quality_path.write_text(json.dumps(quality, indent=2), encoding="utf-8")
@@ -2583,7 +2778,9 @@ def run_inference(
         print(f"Saved assignment diagnostics: {diagnostics_path}")
         print(f"Saved assignment quality report: {quality_path}")
         print(
-            f"Assigned {quality['assigned_tracks']}/{quality['track_count']} tracks; "
+            f"Assigned {quality.get('assigned_fragments', quality.get('assigned_tracks'))}/"
+            f"{quality.get('fragment_count', quality.get('track_count'))} "
+            f"{'fragments' if args.identity_assignment == 'idtracker' else 'tracks'}; "
             f"identity collisions occur in "
             f"{quality['identity_collision_frame_fraction']:.1%} of multi-detection frames."
         )
@@ -2617,6 +2814,7 @@ def run_inference(
             identity_by_track,
             detection_projection,
             projection_name,
+            identity_by_detection,
         )
         write_track_latents(
             track_latent_path,
@@ -2697,8 +2895,9 @@ def build_parser():
         choices=("idtracker", "kmeans"),
         default="idtracker",
         help=(
-            "identity assignment strategy; idtracker aggregates detection votes and "
-            "enforces that coexisting tracks have different identities"
+            "identity assignment strategy; idtracker clusters safe crop embeddings, "
+            "aggregates votes by conservative fragment, and enforces that coexisting "
+            "fragments have different identities"
         ),
     )
     parser.add_argument(
@@ -2706,8 +2905,8 @@ def build_parser():
         type=int,
         default=30,
         help=(
-            "minimum detections required in every track of a complete coexisting "
-            "track group before it can initialize and anchor identity clusters"
+            "minimum detections required in every conservative fragment of a complete "
+            "coexisting group before it can initialize and anchor identity clusters"
         ),
     )
     parser.add_argument(
@@ -3004,7 +3203,11 @@ def main():
     detections, raw_rows = read_manifests(args.manifest, args.video)
     metadata = build_track_metadata(detections)
     training_fragments = None
-    if args.mode in {"train", "train-predict", "sample-pairs"} or args.export_pair_samples:
+    if (
+        args.mode in {"train", "train-predict", "sample-pairs"}
+        or (args.mode == "predict" and args.identity_assignment == "idtracker")
+        or args.export_pair_samples
+    ):
         if args.training_fragments == "conservative":
             print("Building conservative contiguous training fragments...", flush=True)
             training_fragments = build_conservative_training_fragments(
@@ -3109,6 +3312,7 @@ def main():
             device,
             background_store,
             preloaded_crop_store,
+            training_fragments,
         )
 
 
