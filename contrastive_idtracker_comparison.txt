@@ -1,14 +1,14 @@
 BehaveAI contrastive identity vs. idtracker.ai v6
 ================================================
 
-Recorded: 2026-09-30
+Recorded: 2026-10-01
 
 Purpose
 -------
-This note records the important differences between our current
-contrastive_identity.py implementation and idtracker.ai v6. The current code
-is intentionally simpler, but these differences are useful candidates for
-future accuracy and performance work.
+This note records the important differences between contrastive_identity.py
+and idtracker.ai v6. As of 2026-10-01, the default network and contrastive
+training loop intentionally follow idtracker.ai much more closely. The older
+BehaveAI network remains selectable and old checkpoints remain compatible.
 
 
 What both systems do
@@ -22,35 +22,41 @@ What both systems do
   clusters when one is available.
 
 
-Current BehaveAI implementation
--------------------------------
+Current default BehaveAI implementation
+----------------------------------------
 Network:
-* Small custom four-block CNN with 32, 64, 128, and 256 channels.
-* RGB input, 96 x 96 pixels by default (configurable with --input-size).
-* 128-dimensional normalized embedding.
-* Separate 64-dimensional normalized projection head used during training.
-* AdamW optimizer.
+* The same torchvision ResNet-18 structure used by idtracker.ai.
+* One-channel grayscale input, 96 x 96 pixels by default.
+* Direct 8-dimensional, unnormalized embedding with a bias-free final layer.
+* Adam optimizer at learning rate 0.001 by default.
+* --architecture small-cnn retains the previous RGB model, and checkpoints
+  without architecture metadata are recognized as that legacy model.
 
 Training batches and loss:
-* Default batch size is 128 images.
-* Default composition is 32 track fragments x 4 images per fragment.
-* Computes all usable relationships within the batch.
-* Positive loss is mean cosine distance between images from the same track.
-* Negative loss is a margin penalty for known-different coexisting tracks.
-* Relationships between nonoverlapping tracks are left unknown and excluded.
-* Sampling starts from an anchor track, adds its known negatives, and fills any
-  remaining batch positions with other tracks.
-* There is not yet adaptive hard-pair mining or silhouette-based early stopping.
+* Builds explicit positive pairs from each eligible fragment and explicit
+  negative pairs from coexisting fragments. Nonoverlapping tracks stay unknown.
+* Fragments need at least four detections by default.
+* Each optimizer step samples 400 negative and 400 positive pairs (1,600 image
+  evaluations), matching idtracker.ai. Forward chunks bound peak VRAM without
+  changing the effective optimizer batch.
+* Uses Euclidean pairwise contrastive loss with the idtracker.ai margin of 10;
+  positives are penalized above distance 1 and negatives below the margin.
+* Pair probabilities combine fragment size with decaying recent failure counts,
+  emphasizing relationships the network still gets wrong.
+* Periodically clusters sampled validation embeddings, records silhouette score,
+  restores the best model, and stops at the 0.91 target or patience limit.
 
 Crop handling:
-* Training crops are materialized sequentially by default.
+* Training crops are materialized sequentially by default. Grayscale uint8
+  crops require one-third the storage of the old RGB crop array.
 * Automatic storage uses uint8 RAM when there is enough headroom, otherwise a
   disk-backed NumPy memory map. On-demand video seeking remains optional.
 * Median-background masking is optional; unmasked full bounding-box crops are
   also supported.
 
 Clustering and assignment:
-* Cosine K-means operates on track-mean embeddings.
+* Euclidean K-means operates on direct ResNet outputs. The legacy model retains
+  cosine K-means and normalized track embeddings.
 * Detection embeddings then vote for a fragment-level identity distribution.
 * A complete coexisting track group initializes and anchors cluster identities
   when all member tracks meet the minimum length.
@@ -116,32 +122,29 @@ The main unresolved accuracy question is whether nonoverlapping fragments from
 the same animal retain the same identity.
 
 
-Most promising future experiments
-----------------------------------
+Remaining differences and promising experiments
+------------------------------------------------
 1. Add visual and quantitative track-break continuity validation.
 2. Report per-identity detection/track counts and embedding separation.
 3. Compare masked and unmasked crops using the same train/validation split.
-4. Add silhouette monitoring and checkpoint the best embedding model rather
-   than always using the final epoch.
-5. Add adaptive hard positive/negative fragment-pair sampling.
-6. Compare the current CNN with a grayscale or RGB ResNet-18 while keeping the
-   assignment stage unchanged.
-7. Compare 8-D, 32-D, and 128-D embeddings; high-dimensional output is useful
+4. Compare 8-D, 32-D, and 128-D embeddings; high-dimensional output is useful
    for transfer, but idtracker.ai demonstrates that a compact identity space can
    cluster very effectively.
-8. Try image-level MiniBatchKMeans instead of fitting centers only to track means.
-9. Add an optional accumulation/refinement stage for confidently assigned tracks.
-10. Keep clustering and identity assignment as separate interfaces so K-means,
+5. Try image-level MiniBatchKMeans instead of fitting centers only to track means.
+6. Add an optional accumulation/refinement stage for confidently assigned tracks.
+7. Match idtracker.ai's dedicated validation split more exactly; the current
+   silhouette check samples the training crop pool with augmentation disabled.
+8. Keep clustering and identity assignment as separate interfaces so K-means,
     GMM, agglomerative, graph-constrained, and unknown-N approaches can be tested
     without changing embedding training.
 
 
 Interpretation of training output
 ---------------------------------
-* positive_loss: mean same-track cosine distance; lower is better.
-* negative_loss: penalty for coexisting tracks inside the negative margin;
-  lower is better.
-* loss: positive_loss + negative_loss.
+* positive_loss: mean penalty for positive-pair distance above 1; lower is better.
+* negative_loss: mean penalty for negative-pair distance below 10; lower is better.
+* loss: mean pair loss across the balanced positive/negative batch.
+* validation silhouette: cluster separation from -1 to 1; higher is better.
 These are not accuracies. Final performance should be judged with assignment
 coverage, collision checks, continuity across track breaks, visual inspection,
 and—when ground truth is available—identity accuracy.

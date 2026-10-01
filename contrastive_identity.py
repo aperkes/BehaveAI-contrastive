@@ -53,6 +53,7 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     from torch.utils.data import BatchSampler, DataLoader, Dataset
+    from torchvision.models.resnet import BasicBlock, ResNet
 except ImportError as exc:  # Keep --help and syntax inspection useful without PyTorch.
     torch = None
     nn = None
@@ -60,12 +61,15 @@ except ImportError as exc:  # Keep --help and syntax inspection useful without P
     BatchSampler = object
     DataLoader = None
     Dataset = object
+    BasicBlock = None
+    ResNet = object
     TORCH_IMPORT_ERROR = exc
 else:
     TORCH_IMPORT_ERROR = None
 
 
 DEFAULT_EMBEDDING_DIM = 128
+DEFAULT_IDTRACKER_EMBEDDING_DIM = 8
 DEFAULT_INPUT_SIZE = 96
 
 
@@ -325,6 +329,7 @@ def prepare_detection_crop(
     background=None,
     background_threshold=25,
     background_morph_kernel=3,
+    input_channels=3,
 ):
     """Extract, optionally mask, and resize one detection crop."""
     x1, y1, x2, y2 = item.bbox
@@ -349,7 +354,10 @@ def prepare_detection_crop(
             background_threshold,
             background_morph_kernel,
         )
-    return letterbox_crop(crop, input_size)
+    crop = letterbox_crop(crop, input_size)
+    if input_channels == 1:
+        crop = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)[..., None]
+    return crop
 
 
 class PreloadedCropStore:
@@ -362,6 +370,7 @@ class PreloadedCropStore:
         background_store=None,
         background_threshold=25,
         background_morph_kernel=3,
+        input_channels=3,
         storage="auto",
         cache_path=None,
     ):
@@ -370,7 +379,10 @@ class PreloadedCropStore:
         self.background_store = background_store
         self.background_threshold = background_threshold
         self.background_morph_kernel = background_morph_kernel
-        self.shape = (len(self.detections), self.input_size, self.input_size, 3)
+        self.input_channels = input_channels
+        self.shape = (
+            len(self.detections), self.input_size, self.input_size, self.input_channels
+        )
         self.required_bytes = int(np.prod(self.shape, dtype=np.int64))
         self.cache_path = Path(cache_path) if cache_path is not None else None
         self.storage = self._resolve_storage(storage)
@@ -458,6 +470,7 @@ class PreloadedCropStore:
                         background,
                         self.background_threshold,
                         self.background_morph_kernel,
+                        self.input_channels,
                     )
                     completed += 1
                 percent = 100 * completed / len(self.detections)
@@ -470,13 +483,16 @@ class PreloadedCropStore:
         print("Crop preload complete.")
 
 
-def make_preloaded_crop_store(args, detections, input_size, background_store):
+def make_preloaded_crop_store(
+    args, detections, input_size, background_store, input_channels=3
+):
     return PreloadedCropStore(
         detections,
         input_size,
         background_store,
         args.background_threshold,
         args.background_morph_kernel,
+        input_channels,
         storage=args.crop_storage,
         cache_path=Path(args.output_dir) / "crop_cache" / "crops.npy",
     )
@@ -496,6 +512,7 @@ class VideoCropDataset(Dataset):
         background_threshold=25,
         background_morph_kernel=3,
         preloaded_crop_store=None,
+        input_channels=3,
     ):
         self.detections = detections
         self.labels = [track_to_label[item.track_key] for item in detections]
@@ -506,6 +523,7 @@ class VideoCropDataset(Dataset):
         self.background_threshold = background_threshold
         self.background_morph_kernel = background_morph_kernel
         self.preloaded_crop_store = preloaded_crop_store
+        self.input_channels = input_channels
         self.crop_cache = OrderedDict()
         self.captures = {}
         self.last_frame_key = None
@@ -558,6 +576,7 @@ class VideoCropDataset(Dataset):
             background,
             self.background_threshold,
             self.background_morph_kernel,
+            self.input_channels,
         )
 
         if self.cache_size:
@@ -650,6 +669,8 @@ class IdentityEncoder(_ModuleBase):
         if nn is None:
             require_torch()
         super().__init__()
+        self.architecture = "small-cnn"
+        self.input_channels = 3
         channels = (32, 64, 128, 256)
         blocks = []
         in_channels = 3
@@ -675,6 +696,123 @@ class IdentityEncoder(_ModuleBase):
         if not project:
             return embedding
         return F.normalize(self.projector(embedding), dim=1)
+
+
+class IdtrackerResNet18(ResNet):
+    """The grayscale ResNet18 identity network used by idtracker.ai."""
+
+    def __init__(self, embedding_dim=DEFAULT_IDTRACKER_EMBEDDING_DIM):
+        if nn is None:
+            require_torch()
+        super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=embedding_dim)
+        self.architecture = "idtracker-resnet18"
+        self.input_channels = 1
+        self.conv1 = nn.Conv2d(
+            1, 64, kernel_size=7, stride=2, padding=3, bias=False
+        )
+        self.fc = nn.Linear(512, embedding_dim, bias=False)
+
+    def forward(self, images, project=True):
+        # idtracker.ai trains and clusters the direct, unnormalised network output.
+        return super().forward(images)
+
+
+class FragmentPairDataset(Dataset):
+    """Draw fresh crop pairs from explicit negative and positive fragment pairs."""
+
+    def __init__(self, crop_dataset, indices_by_track, negative_pairs, positive_tracks):
+        self.crop_dataset = crop_dataset
+        self.indices_by_track = indices_by_track
+        self.pairs = list(negative_pairs) + [
+            (track, track) for track in positive_tracks
+        ]
+        self.negative_pair_count = len(negative_pairs)
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, pair_index):
+        first_track, second_track = self.pairs[pair_index]
+        first_index = random.choice(self.indices_by_track[first_track])
+        second_index = random.choice(self.indices_by_track[second_track])
+        if first_track == second_track and len(self.indices_by_track[first_track]) > 1:
+            while second_index == first_index:
+                second_index = random.choice(self.indices_by_track[second_track])
+        first = self.crop_dataset[first_index][0]
+        second = self.crop_dataset[second_index][0]
+        return first, second, pair_index
+
+
+class AdaptivePairBatchSampler(BatchSampler):
+    """idtracker-style balanced pair batches with adaptive hard-pair sampling."""
+
+    def __init__(
+        self,
+        negative_pairs,
+        positive_tracks,
+        indices_by_track,
+        pairs_per_class,
+        batches_per_epoch,
+        score_decay=0.98,
+    ):
+        self.negative_count = len(negative_pairs)
+        self.positive_count = len(positive_tracks)
+        self.pairs_per_class = pairs_per_class
+        self.batches_per_epoch = batches_per_epoch
+        self.score_decay = score_decay
+        negative_sizes = [
+            len(indices_by_track[a]) + len(indices_by_track[b])
+            for a, b in negative_pairs
+        ]
+        positive_sizes = [len(indices_by_track[track]) for track in positive_tracks]
+        self.size_weights = torch.tensor(
+            negative_sizes + positive_sizes, dtype=torch.float64
+        )
+        self.scores = torch.full((len(self.size_weights),), 10.0, dtype=torch.float64)
+
+    def __len__(self):
+        return self.batches_per_epoch
+
+    @staticmethod
+    def _normalise(values):
+        return values / values.sum().clamp_min(1e-12)
+
+    def _probabilities(self, start, stop):
+        sizes = self._normalise(self.size_weights[start:stop])
+        scores = self._normalise(self.scores[start:stop])
+        return self._normalise(sizes + scores)
+
+    def __iter__(self):
+        for _ in range(self.batches_per_epoch):
+            negative = torch.multinomial(
+                self._probabilities(0, self.negative_count),
+                self.pairs_per_class,
+                replacement=True,
+            )
+            positive = torch.multinomial(
+                self._probabilities(self.negative_count, len(self.scores)),
+                self.pairs_per_class,
+                replacement=True,
+            ) + self.negative_count
+            # Keeping negatives first matches the loss convention in idtracker.ai.
+            yield torch.cat((negative, positive)).tolist()
+
+    def update(self, pair_indices, losses):
+        active = losses > 0
+        if np.any(active):
+            counts = np.bincount(
+                pair_indices[active], minlength=len(self.scores)
+            ).astype(np.float64)
+            self.scores += torch.from_numpy(counts)
+        self.scores.mul_(self.score_decay)
+
+
+def idtracker_pair_losses(first, second, negative_count, margin):
+    """Per-pair Euclidean losses matching idtracker.ai's contrastive criterion."""
+    distances = F.pairwise_distance(first, second)
+    negative = F.relu(margin - distances[:negative_count]).square()
+    positive = F.relu(distances[negative_count:] - 1.0).square()
+    return torch.cat((negative, positive)), negative, positive
 
 
 def track_contrastive_loss(projected, labels, known_different, margin):
@@ -728,10 +866,22 @@ def resolve_preprocessing(args, checkpoint_path, device):
 def make_model(args, device, checkpoint_path=None):
     checkpoint = load_checkpoint(checkpoint_path, device) if checkpoint_path else None
     stored = checkpoint_configuration(checkpoint) if checkpoint else {}
-    embedding_dim = stored.get("embedding_dim", args.embedding_dim or DEFAULT_EMBEDDING_DIM)
+    # Checkpoints predating the architecture field contain the original RGB CNN.
+    architecture = stored.get(
+        "architecture", "small-cnn" if checkpoint else args.architecture
+    )
+    default_embedding_dim = (
+        DEFAULT_IDTRACKER_EMBEDDING_DIM
+        if architecture == "idtracker-resnet18"
+        else DEFAULT_EMBEDDING_DIM
+    )
+    embedding_dim = stored.get("embedding_dim", args.embedding_dim or default_embedding_dim)
     projection_dim = stored.get("projection_dim", args.projection_dim)
     input_size = stored.get("input_size", args.input_size or DEFAULT_INPUT_SIZE)
-    model = IdentityEncoder(embedding_dim, projection_dim).to(device)
+    if architecture == "idtracker-resnet18":
+        model = IdtrackerResNet18(embedding_dim).to(device)
+    else:
+        model = IdentityEncoder(embedding_dim, projection_dim).to(device)
     if checkpoint:
         model.load_state_dict(checkpoint["model_state"])
     return model, embedding_dim, projection_dim, input_size
@@ -751,7 +901,7 @@ def train_model(
     )
     if args.crop_storage != "on-demand" and preloaded_crop_store is None:
         preloaded_crop_store = make_preloaded_crop_store(
-            args, detections, input_size, background_store
+            args, detections, input_size, background_store, model.input_channels
         )
     dataset = VideoCropDataset(
         detections,
@@ -763,22 +913,8 @@ def train_model(
         background_threshold=args.background_threshold,
         background_morph_kernel=args.background_morph_kernel,
         preloaded_crop_store=preloaded_crop_store,
+        input_channels=model.input_channels,
     )
-    effective_tracks_per_batch = min(args.tracks_per_batch, len(indices_by_track))
-    effective_batch_size = effective_tracks_per_batch * args.samples_per_track
-    batches_per_epoch = args.batches_per_epoch or max(
-        1, int(np.ceil(len(detections) / effective_batch_size))
-    )
-    sampler = TrackBatchSampler(
-        indices_by_track,
-        known_different,
-        effective_tracks_per_batch,
-        args.samples_per_track,
-        batches_per_epoch,
-    )
-    loader = DataLoader(dataset, batch_sampler=sampler, num_workers=0)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
-    known_different_tensor = torch.from_numpy(known_different)
 
     if preloaded_crop_store is not None:
         print(
@@ -793,48 +929,15 @@ def train_model(
             flush=True,
         )
 
-    if not known_different.any():
-        print(
-            "Warning: no temporally overlapping tracks were found. Training has positives "
-            "but no reliable negative pairs, so identity separation will be weak."
+    if model.architecture == "idtracker-resnet18":
+        best_state = _train_idtracker_style(
+            args, model, dataset, indices_by_track, known_different, device
         )
-
-    print(
-        f"Training on {len(detections)} detections from {len(track_keys)} tracks "
-        f"using {device}. Effective batch size: "
-        f"{effective_batch_size} images "
-        f"({effective_tracks_per_batch} tracks x {args.samples_per_track} samples)."
-    )
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        totals = np.zeros(3, dtype=float)
-        epoch_started = perf_counter()
-        last_report = epoch_started
-        for batch_number, (images, labels, _) in enumerate(loader, start=1):
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            projected = model(images, project=True)
-            loss, positive_loss, negative_loss = track_contrastive_loss(
-                projected, labels, known_different_tensor, args.margin
-            )
-            loss.backward()
-            optimizer.step()
-            totals += (loss.item(), positive_loss.item(), negative_loss.item())
-            now = perf_counter()
-            if batch_number == 1 or batch_number == len(loader) or now - last_report >= 10:
-                report_progress(
-                    f"epoch {epoch:03d} batches",
-                    batch_number,
-                    len(loader),
-                    epoch_started,
-                )
-                last_report = now
-
-        means = totals / len(loader)
-        print(
-            f"Epoch {epoch:03d}/{args.epochs}: loss={means[0]:.5f} "
-            f"positive_loss={means[1]:.5f} negative_loss={means[2]:.5f}"
+        if best_state is not None:
+            model.load_state_dict(best_state)
+    else:
+        _train_legacy_style(
+            args, model, dataset, indices_by_track, known_different, detections, device
         )
 
     output_dir = Path(args.output_dir)
@@ -844,6 +947,8 @@ def train_model(
         {
             "model_state": model.state_dict(),
             "model_config": {
+                "architecture": model.architecture,
+                "input_channels": model.input_channels,
                 "embedding_dim": embedding_dim,
                 "projection_dim": projection_dim,
                 "input_size": input_size,
@@ -861,6 +966,256 @@ def train_model(
     dataset.close()
     print(f"Saved network: {checkpoint_path}")
     return model, input_size, checkpoint_path, preloaded_crop_store
+
+
+def _train_legacy_style(
+    args, model, dataset, indices_by_track, known_different, detections, device
+):
+    """Retain the original training loop for old checkpoints and comparisons."""
+    effective_tracks = min(args.tracks_per_batch, len(indices_by_track))
+    effective_batch_size = effective_tracks * args.samples_per_track
+    batches_per_epoch = args.batches_per_epoch or max(
+        1, int(np.ceil(len(detections) / effective_batch_size))
+    )
+    sampler = TrackBatchSampler(
+        indices_by_track,
+        known_different,
+        effective_tracks,
+        args.samples_per_track,
+        batches_per_epoch,
+    )
+    loader = DataLoader(dataset, batch_sampler=sampler, num_workers=0)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    known_different_tensor = torch.from_numpy(known_different)
+    print(
+        f"Legacy small-CNN training on {len(detections)} detections using {device}; "
+        f"effective batch {effective_batch_size} images."
+    )
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        totals = np.zeros(3, dtype=float)
+        started = perf_counter()
+        last_report = started
+        for batch_number, (images, labels, _) in enumerate(loader, start=1):
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            loss, positive, negative = track_contrastive_loss(
+                model(images), labels, known_different_tensor,
+                0.5 if args.margin is None else args.margin,
+            )
+            loss.backward()
+            optimizer.step()
+            totals += (loss.item(), positive.item(), negative.item())
+            now = perf_counter()
+            if batch_number == 1 or batch_number == len(loader) or now - last_report >= 10:
+                report_progress(f"epoch {epoch:03d} batches", batch_number, len(loader), started)
+                last_report = now
+        means = totals / len(loader)
+        print(
+            f"Epoch {epoch:03d}/{args.epochs}: loss={means[0]:.5f} "
+            f"positive_loss={means[1]:.5f} negative_loss={means[2]:.5f}"
+        )
+
+
+def _train_idtracker_style(
+    args, model, dataset, indices_by_track, known_different, device
+):
+    """Train with idtracker.ai's fragment pairs, loss, and adaptive sampling."""
+    eligible = sorted(
+        track for track, indices in indices_by_track.items()
+        if len(indices) >= args.min_fragment_length
+    )
+    eligible_set = set(eligible)
+    negative_pairs = [
+        (first, second)
+        for first in eligible
+        for second in np.flatnonzero(known_different[first])
+        if first < second and int(second) in eligible_set
+    ]
+    if not eligible:
+        raise ValueError(
+            "No fragments meet --min-fragment-length; lower it or check the manifest."
+        )
+    if not negative_pairs:
+        raise ValueError(
+            "No coexisting fragment pairs meet --min-fragment-length. The idTracker "
+            "training loss requires reliable negative pairs."
+        )
+    pair_dataset = FragmentPairDataset(
+        dataset, indices_by_track, negative_pairs, eligible
+    )
+    # A batch contains this many negative pairs plus the same number of positives.
+    # Each pair contains two images, exactly as in idtracker.ai.
+    batches_per_epoch = args.batches_per_epoch or max(
+        1, int(np.ceil(len(dataset) / (4 * args.pairs_per_batch)))
+    )
+    sampler = AdaptivePairBatchSampler(
+        negative_pairs,
+        eligible,
+        indices_by_track,
+        args.pairs_per_batch,
+        batches_per_epoch,
+    )
+    loader = DataLoader(pair_dataset, batch_sampler=sampler, num_workers=0)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    print(
+        f"idTracker-style training on {len(dataset)} detections from {len(eligible)} "
+        f"eligible fragments ({len(negative_pairs)} negative and {len(eligible)} "
+        f"positive fragment pairs) using {device}. Each optimizer step samples "
+        f"{args.pairs_per_batch} pairs per class / {4 * args.pairs_per_batch} images."
+    )
+    print(
+        f"Forward passes are chunked to {args.forward_pair_chunk_size} pairs to bound VRAM."
+    )
+    validation_interval = args.validation_interval or (
+        max(5 * args.num_individuals, 100) if args.num_individuals else None
+    )
+    best_score = -np.inf
+    best_state = None
+    validations = stale_validations = total_batches = 0
+    stop_training = False
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        totals = np.zeros(3, dtype=float)
+        completed_batches = 0
+        started = perf_counter()
+        last_report = started
+        for batch_number, (first, second, pair_indices) in enumerate(loader, start=1):
+            completed_batches = batch_number
+            optimizer.zero_grad(set_to_none=True)
+            batch_losses = []
+            negative_sum = positive_sum = 0.0
+            pair_count = len(pair_indices)
+            negative_count = pair_count // 2
+            chunk = args.forward_pair_chunk_size
+            for start in range(0, pair_count, chunk):
+                stop = min(start + chunk, pair_count)
+                images = torch.cat((first[start:stop], second[start:stop]), dim=0).to(device)
+                vectors = model(images)
+                chunk_size = stop - start
+                first_vectors, second_vectors = vectors[:chunk_size], vectors[chunk_size:]
+                chunk_negative = max(0, min(stop, negative_count) - start)
+                losses, negative, positive = idtracker_pair_losses(
+                    first_vectors, second_vectors, chunk_negative,
+                    10.0 if args.margin is None else args.margin,
+                )
+                (losses.sum() / pair_count).backward()
+                batch_losses.append(losses.detach().cpu().numpy())
+                negative_sum += float(negative.sum().detach())
+                positive_sum += float(positive.sum().detach())
+            optimizer.step()
+            total_batches += 1
+            loss_values = np.concatenate(batch_losses)
+            sampler.update(pair_indices.numpy(), loss_values)
+            totals += (
+                float(loss_values.mean()),
+                positive_sum / args.pairs_per_batch,
+                negative_sum / args.pairs_per_batch,
+            )
+            now = perf_counter()
+            if batch_number == 1 or batch_number == len(loader) or now - last_report >= 10:
+                report_progress(f"epoch {epoch:03d} batches", batch_number, len(loader), started)
+                last_report = now
+            if (
+                validation_interval
+                and total_batches >= args.validation_warmup * validation_interval
+                and total_batches % validation_interval == 0
+            ):
+                score = _embedding_silhouette_score(
+                    args, model, dataset, eligible, indices_by_track, device
+                )
+                validations += 1
+                improved = score > best_score
+                if improved:
+                    best_score = score
+                    stale_validations = 0
+                    best_state = {
+                        name: value.detach().cpu().clone()
+                        for name, value in model.state_dict().items()
+                    }
+                else:
+                    stale_validations += 1
+                print(
+                    f"  validation {validations}: silhouette={score:.4f}, "
+                    f"best={best_score:.4f}, stale={stale_validations}",
+                    flush=True,
+                )
+                if (
+                    stale_validations > args.validation_patience
+                    or (best_score > args.silhouette_target and stale_validations > 1)
+                ):
+                    reason = (
+                        "target reached and stable"
+                        if best_score > args.silhouette_target
+                        else "patience exhausted"
+                    )
+                    print(f"Stopping contrastive training: {reason}.")
+                    stop_training = True
+                    break
+        means = totals / completed_batches
+        print(
+            f"Epoch {epoch:03d}/{args.epochs}: loss={means[0]:.5f} "
+            f"positive_loss={means[1]:.5f} negative_loss={means[2]:.5f}"
+        )
+        if stop_training:
+            break
+    return best_state
+
+
+def _embedding_silhouette_score(
+    args, model, dataset, eligible_tracks, indices_by_track, device
+):
+    """Cluster held-out sampled crops and compute an idTracker-style silhouette."""
+    limit = args.validation_images_per_individual * args.num_individuals
+    candidates = np.concatenate(
+        [np.asarray(indices_by_track[track], dtype=np.int64) for track in eligible_tracks]
+    )
+    generator = np.random.default_rng(args.seed + len(candidates))
+    if len(candidates) > limit:
+        candidates = generator.choice(candidates, limit, replace=False)
+    previous_augment = dataset.augment
+    dataset.augment = False
+    vectors = []
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, len(candidates), args.inference_batch_size):
+            images = torch.stack(
+                [dataset[int(index)][0] for index in candidates[start:start + args.inference_batch_size]]
+            ).to(device)
+            vectors.append(model(images).cpu().numpy())
+    dataset.augment = previous_augment
+    model.train()
+    vectors = np.concatenate(vectors)
+    assignments, _, _ = euclidean_kmeans(
+        vectors, args.num_individuals, args.seed, restarts=5
+    )
+    query_indices = np.arange(len(vectors))
+    if len(query_indices) > args.silhouette_samples:
+        query_indices = generator.choice(
+            query_indices, args.silhouette_samples, replace=False
+        )
+    scores = []
+    for query_start in range(0, len(query_indices), 128):
+        selected = query_indices[query_start:query_start + 128]
+        distances = np.sqrt(
+            np.maximum(
+                ((vectors[selected, None] - vectors[None]) ** 2).sum(axis=2), 0
+            )
+        )
+        for row, index in enumerate(selected):
+            own = assignments == assignments[index]
+            own_count = int(own.sum())
+            if own_count <= 1:
+                continue
+            a = float(distances[row, own].sum() / (own_count - 1))
+            b = min(
+                float(distances[row, assignments == identity].mean())
+                for identity in range(args.num_individuals)
+                if identity != assignments[index]
+                and np.any(assignments == identity)
+            )
+            scores.append((b - a) / max(a, b, 1e-12))
+    return float(np.mean(scores)) if scores else -1.0
 
 
 def extract_embeddings(
@@ -884,6 +1239,7 @@ def extract_embeddings(
         background_threshold=args.background_threshold,
         background_morph_kernel=args.background_morph_kernel,
         preloaded_crop_store=preloaded_crop_store,
+        input_channels=model.input_channels,
     )
     loader = DataLoader(
         dataset,
@@ -927,8 +1283,6 @@ def aggregate_tracks(embeddings, detections, track_to_label, track_count):
         track_embeddings[label] += vector
         counts[label] += 1
     track_embeddings /= counts[:, None]
-    norms = np.linalg.norm(track_embeddings, axis=1, keepdims=True)
-    track_embeddings /= np.maximum(norms, 1e-12)
     return track_embeddings, counts
 
 
@@ -942,6 +1296,7 @@ def export_crop_samples(
     background_threshold,
     background_morph_kernel,
     preloaded_crop_store=None,
+    input_channels=3,
 ):
     """Export deterministic, non-augmented examples of network input crops."""
     sample_count = min(sample_count, len(detections))
@@ -960,6 +1315,7 @@ def export_crop_samples(
         background_threshold=background_threshold,
         background_morph_kernel=background_morph_kernel,
         preloaded_crop_store=preloaded_crop_store,
+        input_channels=input_channels,
     )
     rows = []
     try:
@@ -974,9 +1330,12 @@ def export_crop_samples(
                 f"track_{safe_track_id}.png"
             )
             crop = dataset._read_crop(int(index))
-            if not cv2.imwrite(
-                str(sample_dir / filename), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
-            ):
+            output_crop = (
+                crop[..., 0]
+                if crop.shape[-1] == 1
+                else cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+            )
+            if not cv2.imwrite(str(sample_dir / filename), output_crop):
                 raise RuntimeError(f"Could not write crop sample: {sample_dir / filename}")
             rows.append(
                 {
@@ -1066,11 +1425,59 @@ def cosine_kmeans(
     return best_assignments, best_centers, similarities
 
 
-def cluster_identities(track_embeddings, number_of_individuals, seed):
+def euclidean_kmeans(
+    vectors, number_of_individuals, seed, initial_centers=None, restarts=20
+):
+    """Dependency-free Euclidean K-means for idTracker network outputs."""
+    vectors = np.asarray(vectors, dtype=np.float32)
+    if not 1 <= number_of_individuals <= len(vectors):
+        raise ValueError(
+            f"Cannot form {number_of_individuals} clusters from {len(vectors)} vectors."
+        )
+    generator = np.random.default_rng(seed)
+    best = None
+    attempts = 1 if initial_centers is not None else restarts
+    for _ in range(attempts):
+        if initial_centers is not None:
+            centers = np.asarray(initial_centers, dtype=np.float32).copy()
+        else:
+            # K-means++ seeding, matching the initialization used by idtracker.ai.
+            chosen = [int(generator.integers(len(vectors)))]
+            while len(chosen) < number_of_individuals:
+                distances = ((vectors[:, None] - vectors[chosen][None]) ** 2).sum(2)
+                weights = distances.min(axis=1)
+                if weights.sum() == 0:
+                    remaining = np.setdiff1d(np.arange(len(vectors)), chosen)
+                    chosen.append(int(generator.choice(remaining)))
+                else:
+                    chosen.append(int(generator.choice(len(vectors), p=weights / weights.sum())))
+            centers = vectors[chosen].copy()
+        assignments = np.full(len(vectors), -1, dtype=np.int64)
+        for _ in range(200):
+            squared = ((vectors[:, None] - centers[None]) ** 2).sum(axis=2)
+            updated = squared.argmin(axis=1)
+            if np.array_equal(updated, assignments):
+                break
+            assignments = updated
+            for identity in range(number_of_individuals):
+                members = vectors[assignments == identity]
+                centers[identity] = (
+                    members.mean(axis=0)
+                    if len(members)
+                    else vectors[np.argmax(squared.min(axis=1))]
+                )
+        squared = ((vectors[:, None] - centers[None]) ** 2).sum(axis=2)
+        cost = float(squared[np.arange(len(vectors)), assignments].sum())
+        if best is None or cost < best[0]:
+            best = cost, assignments.copy(), centers.copy(), squared
+    _, assignments, centers, squared = best
+    return assignments, centers, squared
+
+
+def cluster_identities(track_embeddings, number_of_individuals, seed, metric="cosine"):
     """Original unconstrained track-level clustering baseline."""
-    assignments, _, _ = cosine_kmeans(
-        track_embeddings, number_of_individuals, seed
-    )
+    cluster = euclidean_kmeans if metric == "euclidean" else cosine_kmeans
+    assignments, _, _ = cluster(track_embeddings, number_of_individuals, seed)
     return assignments
 
 
@@ -1216,6 +1623,7 @@ def idtracker_identity_assignment(
     number_of_individuals,
     seed,
     global_fragment_min_frames,
+    metric="cosine",
 ):
     """Cluster detections, then assign whole fragments using video constraints."""
     reference = find_reference_global_fragment(
@@ -1233,13 +1641,24 @@ def idtracker_identity_assignment(
             for identity, track in enumerate(reference["track_labels"])
         }
 
-    _, centers, _ = cosine_kmeans(
-        track_embeddings,
-        number_of_individuals,
-        seed,
-        initial_centers=initial_centers,
-    )
-    detection_assignments = (_normalize_rows(embeddings) @ centers.T).argmax(axis=1)
+    if metric == "euclidean":
+        _, centers, _ = euclidean_kmeans(
+            track_embeddings,
+            number_of_individuals,
+            seed,
+            initial_centers=initial_centers,
+        )
+        detection_assignments = (
+            (embeddings[:, None] - centers[None]) ** 2
+        ).sum(axis=2).argmin(axis=1)
+    else:
+        _, centers, _ = cosine_kmeans(
+            track_embeddings,
+            number_of_individuals,
+            seed,
+            initial_centers=initial_centers,
+        )
+        detection_assignments = (_normalize_rows(embeddings) @ centers.T).argmax(axis=1)
     detection_track_labels = np.asarray(
         [track_to_label[item.track_key] for item in detections], dtype=np.int64
     )
@@ -1503,6 +1922,9 @@ def run_inference(
     track_embeddings, track_counts = aggregate_tracks(
         embeddings, detections, track_to_label, len(track_keys)
     )
+    metric = "euclidean" if model.architecture == "idtracker-resnet18" else "cosine"
+    if metric == "cosine":
+        track_embeddings = _normalize_rows(track_embeddings)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1521,6 +1943,7 @@ def run_inference(
                     args.num_individuals,
                     args.seed,
                     args.global_fragment_min_frames,
+                    metric,
                 )
             )
             if reference is None:
@@ -1536,7 +1959,7 @@ def run_inference(
                 )
         else:
             identity_by_track = cluster_identities(
-                track_embeddings, args.num_individuals, args.seed
+                track_embeddings, args.num_individuals, args.seed, metric
             )
             assignment_confidence = np.ones(len(track_embeddings), dtype=np.float64)
             p1 = None
@@ -1715,24 +2138,66 @@ def build_parser():
 
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--embedding-dim", type=int)
+    parser.add_argument(
+        "--architecture",
+        choices=("idtracker-resnet18", "small-cnn"),
+        default="idtracker-resnet18",
+        help="identity network; checkpoints always restore their saved architecture",
+    )
+    parser.add_argument(
+        "--embedding-dim",
+        type=int,
+        help="latent dimensions (8 for idTracker ResNet18, 128 for the legacy CNN)",
+    )
     parser.add_argument("--projection-dim", type=int, default=64)
     parser.add_argument("--input-size", type=int)
-    parser.add_argument("--margin", type=float, default=0.5)
+    parser.add_argument(
+        "--margin",
+        type=float,
+        help="contrastive margin (10 for idTracker training, 0.5 for legacy training)",
+    )
+    parser.add_argument(
+        "--pairs-per-batch",
+        type=int,
+        default=400,
+        help="negative pairs per optimizer step; an equal number of positives is added",
+    )
+    parser.add_argument(
+        "--forward-pair-chunk-size",
+        type=int,
+        default=128,
+        help="pairs evaluated at once inside a large idTracker-style optimizer batch",
+    )
+    parser.add_argument(
+        "--min-fragment-length",
+        type=int,
+        default=4,
+        help="minimum detections for a fragment to participate in pair training",
+    )
+    parser.add_argument(
+        "--validation-interval",
+        type=int,
+        help="optimizer steps between silhouette checks; auto is max(5*N, 100)",
+    )
+    parser.add_argument("--validation-warmup", type=int, default=5)
+    parser.add_argument("--silhouette-target", type=float, default=0.91)
+    parser.add_argument("--validation-patience", type=int, default=30)
+    parser.add_argument("--validation-images-per-individual", type=int, default=1000)
+    parser.add_argument("--silhouette-samples", type=int, default=2000)
     parser.add_argument(
         "--batch-size",
         type=int,
         default=128,
         help=(
-            "total images in each training batch; must be divisible by "
-            "--samples-per-track"
+            "legacy small-CNN image batch; must be divisible by "
+            "--samples-per-track (the ResNet uses --pairs-per-batch)"
         ),
     )
     parser.add_argument(
         "--tracks-per-batch",
         type=int,
         help=(
-            "advanced override for the number of tracks per batch; when supplied, "
+            "legacy small-CNN override for tracks per batch; when supplied, "
             "the effective batch size is this value times --samples-per-track"
         ),
     )
@@ -1803,6 +2268,18 @@ def validate_args(args, parser):
         parser.error(f"--num-individuals is required in {args.mode} mode")
     if args.checkpoint and args.mode in {"train", "train-predict"}:
         parser.error("Use --init-checkpoint, not --checkpoint, when training.")
+    if args.pairs_per_batch < 1:
+        parser.error("--pairs-per-batch must be at least 1")
+    if args.forward_pair_chunk_size < 1:
+        parser.error("--forward-pair-chunk-size must be at least 1")
+    if args.min_fragment_length < 2:
+        parser.error("--min-fragment-length must be at least 2")
+    if args.validation_interval is not None and args.validation_interval < 1:
+        parser.error("--validation-interval must be at least 1")
+    if args.validation_warmup < 0 or args.validation_patience < 1:
+        parser.error("validation warmup/patience values are invalid")
+    if args.validation_images_per_individual < 1 or args.silhouette_samples < 1:
+        parser.error("validation sample limits must be at least 1")
     if args.samples_per_track < 2:
         parser.error("--samples-per-track must be at least 2 to form positive pairs")
     if args.batch_size < 1:
@@ -1876,7 +2353,7 @@ def main():
         # modes remain available when repeated access is desired.
         if args.crop_storage in {"ram", "disk"}:
             preloaded_crop_store = make_preloaded_crop_store(
-                args, detections, input_size, background_store
+                args, detections, input_size, background_store, model.input_channels
             )
 
     if args.export_crop_samples:
@@ -1890,6 +2367,7 @@ def main():
             args.background_threshold,
             args.background_morph_kernel,
             preloaded_crop_store,
+            model.input_channels,
         )
 
     if args.mode in {"train-predict", "predict", "embed"}:
