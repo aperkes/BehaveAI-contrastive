@@ -34,6 +34,13 @@ Network:
   without architecture metadata are recognized as that legacy model.
 
 Training batches and loss:
+* BehaveAI motion tracks are split into conservative, contiguous training
+  fragments around close encounters, near-tied direct/swapped motion matches,
+  abrupt motion changes, and detection gaps. A configurable buffer around each
+  ambiguous event is excluded from training.
+* Short-gap position interpolation is used only to detect uncertain encounters;
+  interpolated points never become crops or join positive fragments. The filter
+  is local and does not require all animals to be visible in a frame.
 * Builds explicit positive pairs from each eligible fragment and explicit
   negative pairs from coexisting fragments. Nonoverlapping tracks stay unknown.
 * Fragments need at least four detections by default.
@@ -48,8 +55,10 @@ Training batches and loss:
   restores the best model, and stops at the 0.91 target or patience limit.
 
 Crop handling:
-* Training crops are materialized sequentially by default. Grayscale uint8
-  crops require one-third the storage of the old RGB crop array.
+* Only crops retained in eligible training fragments are materialized
+  sequentially by default. Grayscale uint8 crops require one-third the storage
+  of the old RGB crop array. Detections needed only for later full-video
+  inference are decoded on demand instead of occupying the training cache.
 * Automatic storage uses uint8 RAM when there is enough headroom, otherwise a
   disk-backed NumPy memory map. On-demand video seeking remains optional.
 * Median-background masking is optional; unmasked full bounding-box crops are

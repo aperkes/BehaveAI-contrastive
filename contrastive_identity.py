@@ -87,6 +87,18 @@ class Detection:
         return self.video, self.track_id
 
 
+@dataclass
+class TrainingFragmentMetadata:
+    """Conservative contiguous fragments used only as contrastive supervision."""
+
+    keys: list
+    indices_by_fragment: dict
+    known_different: np.ndarray
+    original_track_by_fragment: dict
+    excluded_detection_count: int
+    uncertainty_event_count: int
+
+
 def require_torch():
     if torch is None:
         raise SystemExit(
@@ -212,6 +224,282 @@ def build_track_metadata(detections):
                 known_different[second, first] = True
 
     return track_keys, track_to_label, indices_by_track, known_different
+
+
+def build_conservative_training_fragments(
+    detections,
+    close_distance=0.75,
+    assignment_margin=0.35,
+    motion_jump=1.5,
+    uncertainty_buffer=5,
+    interpolation_gap=10,
+    min_fragment_length=4,
+):
+    """Split tracks around locally ambiguous encounters without assigning identity.
+
+    Linear interpolation is used only to expose close encounters during short
+    detection gaps. Interpolated locations never become crops and never bridge
+    positive fragments.
+    """
+    observations_by_track = defaultdict(list)
+    states_by_video_frame = defaultdict(list)
+    for index, item in enumerate(detections):
+        x1, y1, x2, y2 = item.bbox
+        center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        scale = max(x2 - x1, y2 - y1, 1)
+        state = {
+            "track": item.track_key,
+            "center": center,
+            "scale": float(scale),
+            "bbox": item.bbox,
+            "observed": True,
+        }
+        observations_by_track[item.track_key].append((item.frame, index, state))
+        states_by_video_frame[(item.video, item.frame)].append(state)
+
+    # Interpolate only bounded internal gaps. This helps flag a visible fish
+    # approaching a temporarily missed track, but does not create supervision.
+    for track, observations in observations_by_track.items():
+        observations.sort()
+        video = track[0]
+        for (first_frame, _, first), (last_frame, _, last) in zip(
+            observations, observations[1:]
+        ):
+            gap = last_frame - first_frame
+            if not 1 < gap <= interpolation_gap + 1:
+                continue
+            for frame in range(first_frame + 1, last_frame):
+                fraction = (frame - first_frame) / gap
+                center = (
+                    first["center"][0]
+                    + fraction * (last["center"][0] - first["center"][0]),
+                    first["center"][1]
+                    + fraction * (last["center"][1] - first["center"][1]),
+                )
+                scale = first["scale"] + fraction * (
+                    last["scale"] - first["scale"]
+                )
+                states_by_video_frame[(video, frame)].append(
+                    {
+                        "track": track,
+                        "center": center,
+                        "scale": scale,
+                        "bbox": None,
+                        "observed": False,
+                    }
+                )
+
+    uncertain = defaultdict(set)
+
+    def mark(state, frame):
+        uncertain[state["track"]].add(frame)
+
+    def distance(first, second):
+        return float(np.hypot(
+            first["center"][0] - second["center"][0],
+            first["center"][1] - second["center"][1],
+        ))
+
+    # Very close detections are locally ambiguous regardless of how many other
+    # animals happen to be visible in the frame.
+    for (_, frame), states in states_by_video_frame.items():
+        for position, first in enumerate(states):
+            for second in states[position + 1:]:
+                if first["track"] == second["track"]:
+                    continue
+                scale = max((first["scale"] + second["scale"]) / 2.0, 1.0)
+                if distance(first, second) / scale < close_distance:
+                    mark(first, frame)
+                    mark(second, frame)
+
+    # Compare the recorded continuation with the alternative swapped matching.
+    # A small cost advantage means the motion-only association was not decisive.
+    frames_by_video = defaultdict(list)
+    for video, frame in states_by_video_frame:
+        frames_by_video[video].append(frame)
+    for video, frames in frames_by_video.items():
+        frame_set = set(frames)
+        for frame in sorted(frame_set):
+            if frame - 1 not in frame_set:
+                continue
+            previous = {
+                state["track"]: state
+                for state in states_by_video_frame[(video, frame - 1)]
+            }
+            current = {
+                state["track"]: state
+                for state in states_by_video_frame[(video, frame)]
+            }
+            common = sorted(set(previous).intersection(current))
+            for position, first_track in enumerate(common):
+                for second_track in common[position + 1:]:
+                    first_previous, first_current = (
+                        previous[first_track], current[first_track]
+                    )
+                    second_previous, second_current = (
+                        previous[second_track], current[second_track]
+                    )
+                    scale = max(
+                        np.mean(
+                            [
+                                first_previous["scale"],
+                                first_current["scale"],
+                                second_previous["scale"],
+                                second_current["scale"],
+                            ]
+                        ),
+                        1.0,
+                    )
+                    proximity = min(
+                        distance(first_current, second_current),
+                        distance(first_previous, second_previous),
+                    ) / scale
+                    if proximity > 2.0:
+                        continue
+                    direct = distance(first_previous, first_current) + distance(
+                        second_previous, second_current
+                    )
+                    swapped = distance(first_previous, second_current) + distance(
+                        second_previous, first_current
+                    )
+                    if swapped - direct < assignment_margin * scale:
+                        mark(first_current, frame)
+                        mark(second_current, frame)
+
+    # Abrupt deviations from constant velocity are another indication that an
+    # online track may have transferred to a neighboring animal.
+    for track, observations in observations_by_track.items():
+        for first, second, third in zip(
+            observations, observations[1:], observations[2:]
+        ):
+            first_frame, _, first_state = first
+            second_frame, _, second_state = second
+            third_frame, _, third_state = third
+            if second_frame != first_frame + 1 or third_frame != second_frame + 1:
+                continue
+            predicted = (
+                2 * second_state["center"][0] - first_state["center"][0],
+                2 * second_state["center"][1] - first_state["center"][1],
+            )
+            error = np.hypot(
+                third_state["center"][0] - predicted[0],
+                third_state["center"][1] - predicted[1],
+            )
+            if error / max(third_state["scale"], 1.0) > motion_jump:
+                uncertain[track].add(third_frame)
+
+    expanded_uncertain = defaultdict(set)
+    for track, frames in uncertain.items():
+        for frame in frames:
+            expanded_uncertain[track].update(
+                range(frame - uncertainty_buffer, frame + uncertainty_buffer + 1)
+            )
+
+    fragment_keys = []
+    indices_by_fragment = {}
+    original_track_by_fragment = {}
+    detection_to_fragment = {}
+    excluded = 0
+    for track, observations in sorted(observations_by_track.items()):
+        current = []
+        previous_frame = None
+
+        def finish_fragment():
+            nonlocal current, excluded
+            if not current:
+                return
+            if len(current) < min_fragment_length:
+                excluded += len(current)
+                current = []
+                return
+            fragment = len(fragment_keys)
+            key = (track[0], track[1], fragment)
+            fragment_keys.append(key)
+            indices_by_fragment[fragment] = current
+            original_track_by_fragment[fragment] = track
+            for detection_index in current:
+                detection_to_fragment[detection_index] = fragment
+            current = []
+
+        for frame, index, _ in observations:
+            unsafe = frame in expanded_uncertain[track]
+            # Positive fragments contain consecutive observed detections only;
+            # interpolation is deliberately never used to join them.
+            if unsafe or (previous_frame is not None and frame != previous_frame + 1):
+                finish_fragment()
+            if unsafe:
+                excluded += 1
+            else:
+                current.append(index)
+            previous_frame = frame
+        finish_fragment()
+
+    fragments_by_frame = defaultdict(set)
+    for index, item in enumerate(detections):
+        fragment = detection_to_fragment.get(index)
+        if fragment is not None:
+            fragments_by_frame[(item.video, item.frame)].add(fragment)
+    known_different = np.zeros((len(fragment_keys), len(fragment_keys)), dtype=bool)
+    for fragments in fragments_by_frame.values():
+        fragments = sorted(fragments)
+        for position, first in enumerate(fragments):
+            for second in fragments[position + 1:]:
+                known_different[first, second] = True
+                known_different[second, first] = True
+
+    return TrainingFragmentMetadata(
+        keys=fragment_keys,
+        indices_by_fragment=indices_by_fragment,
+        known_different=known_different,
+        original_track_by_fragment=original_track_by_fragment,
+        excluded_detection_count=excluded,
+        uncertainty_event_count=sum(len(frames) for frames in uncertain.values()),
+    )
+
+
+def use_original_tracks_as_training_fragments(metadata):
+    track_keys, _, indices_by_track, known_different = metadata
+    return TrainingFragmentMetadata(
+        keys=[(video, track_id, label) for label, (video, track_id) in enumerate(track_keys)],
+        indices_by_fragment=dict(indices_by_track),
+        known_different=known_different,
+        original_track_by_fragment={
+            label: track for label, track in enumerate(track_keys)
+        },
+        excluded_detection_count=0,
+        uncertainty_event_count=0,
+    )
+
+
+def write_training_fragment_summary(path, fragments, detections):
+    """Record exactly which contiguous fragments are eligible for supervision."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = (
+        "training_fragment",
+        "source_video",
+        "source_track_id",
+        "first_frame",
+        "last_frame",
+        "detection_count",
+    )
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for fragment, indices in fragments.indices_by_fragment.items():
+            items = [detections[index] for index in indices]
+            video, track_id = fragments.original_track_by_fragment[fragment]
+            writer.writerow(
+                {
+                    "training_fragment": fragment,
+                    "source_video": video,
+                    "source_track_id": track_id,
+                    "first_frame": items[0].frame,
+                    "last_frame": items[-1].frame,
+                    "detection_count": len(items),
+                }
+            )
+    return path
 
 
 def letterbox_crop(image, size):
@@ -373,15 +661,37 @@ class PreloadedCropStore:
         input_channels=3,
         storage="auto",
         cache_path=None,
+        detection_indices=None,
     ):
         self.detections = detections
+        self.detection_indices = np.asarray(
+            sorted(
+                set(
+                    range(len(detections))
+                    if detection_indices is None
+                    else detection_indices
+                )
+            ),
+            dtype=np.int64,
+        )
+        if not len(self.detection_indices):
+            raise ValueError("Cannot create an empty preloaded crop store.")
+        if self.detection_indices[0] < 0 or self.detection_indices[-1] >= len(detections):
+            raise IndexError("Preloaded crop detection index is out of range.")
+        self.storage_index = np.full(len(detections), -1, dtype=np.int64)
+        self.storage_index[self.detection_indices] = np.arange(
+            len(self.detection_indices), dtype=np.int64
+        )
         self.input_size = input_size
         self.background_store = background_store
         self.background_threshold = background_threshold
         self.background_morph_kernel = background_morph_kernel
         self.input_channels = input_channels
         self.shape = (
-            len(self.detections), self.input_size, self.input_size, self.input_channels
+            len(self.detection_indices),
+            self.input_size,
+            self.input_size,
+            self.input_channels,
         )
         self.required_bytes = int(np.prod(self.shape, dtype=np.int64))
         self.cache_path = Path(cache_path) if cache_path is not None else None
@@ -408,14 +718,31 @@ class PreloadedCropStore:
         return selected
 
     def get(self, index):
+        storage_index = int(self.storage_index[index])
+        if storage_index < 0:
+            raise KeyError(index)
         if self.crops is None:
             self._build()
-        return self.crops[index]
+        return self.crops[storage_index]
+
+    def has(self, index):
+        return self.storage_index[index] >= 0
+
+    def release(self):
+        if isinstance(self.crops, np.memmap):
+            self.crops.flush()
+            mmap = getattr(self.crops, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
+        self.crops = None
 
     def _build(self):
         gib = self.required_bytes / 1024 ** 3
         if self.storage == "ram":
-            print(f"Preloading {len(self.detections)} crops into {gib:.2f} GiB of RAM...")
+            print(
+                f"Preloading {len(self.detection_indices)} selected crops into "
+                f"{gib:.2f} GiB of RAM..."
+            )
             self.crops = np.empty(self.shape, dtype=np.uint8)
         elif self.storage == "disk":
             if self.cache_path is None:
@@ -429,7 +756,7 @@ class PreloadedCropStore:
                     f"{self.cache_path.parent}. Use --crop-storage on-demand or free space."
                 )
             print(
-                f"Saving {len(self.detections)} crops to a {gib:.2f} GiB "
+                f"Saving {len(self.detection_indices)} selected crops to a {gib:.2f} GiB "
                 f"memory-mapped cache: {self.cache_path}"
             )
             self.crops = np.lib.format.open_memmap(
@@ -442,8 +769,11 @@ class PreloadedCropStore:
             raise ValueError(f"Unsupported crop storage mode: {self.storage}")
 
         detections_by_video_and_frame = defaultdict(lambda: defaultdict(list))
-        for index, item in enumerate(self.detections):
-            detections_by_video_and_frame[item.video][item.frame].append((index, item))
+        for storage_index, detection_index in enumerate(self.detection_indices):
+            item = self.detections[int(detection_index)]
+            detections_by_video_and_frame[item.video][item.frame].append(
+                (storage_index, item)
+            )
 
         completed = 0
         next_report = 5
@@ -473,7 +803,7 @@ class PreloadedCropStore:
                         self.input_channels,
                     )
                     completed += 1
-                percent = 100 * completed / len(self.detections)
+                percent = 100 * completed / len(self.detection_indices)
                 if percent >= next_report:
                     print(f"  crop preload: {percent:.1f}%", flush=True)
                     next_report += 5
@@ -484,7 +814,12 @@ class PreloadedCropStore:
 
 
 def make_preloaded_crop_store(
-    args, detections, input_size, background_store, input_channels=3
+    args,
+    detections,
+    input_size,
+    background_store,
+    input_channels=3,
+    detection_indices=None,
 ):
     return PreloadedCropStore(
         detections,
@@ -495,6 +830,7 @@ def make_preloaded_crop_store(
         input_channels,
         storage=args.crop_storage,
         cache_path=Path(args.output_dir) / "crop_cache" / "crops.npy",
+        detection_indices=detection_indices,
     )
 
 
@@ -542,7 +878,10 @@ class VideoCropDataset(Dataset):
         return capture
 
     def _read_crop(self, index):
-        if self.preloaded_crop_store is not None:
+        if (
+            self.preloaded_crop_store is not None
+            and self.preloaded_crop_store.has(index)
+        ):
             return self.preloaded_crop_store.get(index)
 
         cached = self.crop_cache.get(index)
@@ -557,7 +896,10 @@ class VideoCropDataset(Dataset):
         else:
             capture = self._capture(item.video)
             # OpenCV frame positions are zero-based; manifest frames are one-based.
-            capture.set(cv2.CAP_PROP_POS_FRAMES, item.frame - 1)
+            target_position = item.frame - 1
+            current_position = int(round(capture.get(cv2.CAP_PROP_POS_FRAMES)))
+            if current_position != target_position:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, target_position)
             ok, frame = capture.read()
             if not ok:
                 raise RuntimeError(f"Could not decode frame {item.frame} from {item.video}")
@@ -905,14 +1247,27 @@ def train_model(
     device,
     background_store,
     preloaded_crop_store=None,
+    training_fragments=None,
 ):
     track_keys, track_to_label, indices_by_track, known_different = metadata
     model, embedding_dim, projection_dim, input_size = make_model(
         args, device, args.init_checkpoint
     )
+    preload_indices = None
+    if model.architecture == "idtracker-resnet18" and training_fragments is not None:
+        preload_indices = [
+            index
+            for indices in training_fragments.indices_by_fragment.values()
+            for index in indices
+        ]
     if args.crop_storage != "on-demand" and preloaded_crop_store is None:
         preloaded_crop_store = make_preloaded_crop_store(
-            args, detections, input_size, background_store, model.input_channels
+            args,
+            detections,
+            input_size,
+            background_store,
+            model.input_channels,
+            preload_indices,
         )
     dataset = VideoCropDataset(
         detections,
@@ -929,7 +1284,7 @@ def train_model(
 
     if preloaded_crop_store is not None:
         print(
-            "Crop loading: sequentially materialize every resized crop in "
+            "Crop loading: sequentially materialize selected training crops in "
             f"{preloaded_crop_store.storage.upper()} before the first training batch.",
             flush=True,
         )
@@ -941,8 +1296,18 @@ def train_model(
         )
 
     if model.architecture == "idtracker-resnet18":
+        fragment_indices = (
+            training_fragments.indices_by_fragment
+            if training_fragments is not None
+            else indices_by_track
+        )
+        fragment_differences = (
+            training_fragments.known_different
+            if training_fragments is not None
+            else known_different
+        )
         best_state = _train_idtracker_style(
-            args, model, dataset, indices_by_track, known_different, device
+            args, model, dataset, fragment_indices, fragment_differences, device
         )
         if best_state is not None:
             model.load_state_dict(best_state)
@@ -969,6 +1334,15 @@ def train_model(
                 "background_samples": args.background_samples,
                 "background_threshold": args.background_threshold,
                 "background_morph_kernel": args.background_morph_kernel,
+            },
+            "training_fragment_config": {
+                "strategy": args.training_fragments,
+                "close_distance": args.fragment_close_distance,
+                "assignment_margin": args.fragment_assignment_margin,
+                "motion_jump": args.fragment_motion_jump,
+                "uncertainty_buffer": args.fragment_uncertainty_buffer,
+                "interpolation_gap": args.fragment_interpolation_gap,
+                "minimum_length": args.min_fragment_length,
             },
             "epochs": args.epochs,
         },
@@ -1055,10 +1429,13 @@ def _train_idtracker_style(
     pair_dataset = FragmentPairDataset(
         dataset, indices_by_track, negative_pairs, eligible
     )
+    training_detection_count = sum(
+        len(indices_by_track[track]) for track in eligible
+    )
     # A batch contains this many negative pairs plus the same number of positives.
     # Each pair contains two images, exactly as in idtracker.ai.
     batches_per_epoch = args.batches_per_epoch or max(
-        1, int(np.ceil(len(dataset) / (4 * args.pairs_per_batch)))
+        1, int(np.ceil(training_detection_count / (4 * args.pairs_per_batch)))
     )
     sampler = AdaptivePairBatchSampler(
         negative_pairs,
@@ -1071,7 +1448,7 @@ def _train_idtracker_style(
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     input_color = "grayscale" if model.input_channels == 1 else "RGB"
     print(
-        f"idTracker-style {input_color} training on {len(dataset)} detections "
+        f"idTracker-style {input_color} training on {training_detection_count} detections "
         f"from {len(eligible)} "
         f"eligible fragments ({len(negative_pairs)} negative and {len(eligible)} "
         f"positive fragment pairs) using {device}. Each optimizer step samples "
@@ -1263,7 +1640,15 @@ def extract_embeddings(
     embeddings = []
     model.eval()
     if preloaded_crop_store is not None:
-        print("Embedding crop loading: preloaded RAM store.", flush=True)
+        selected = len(preloaded_crop_store.detection_indices)
+        if selected == len(detections):
+            description = f"complete preloaded {preloaded_crop_store.storage.upper()} store"
+        else:
+            description = (
+                f"{selected} preloaded training crops plus on-demand decoding "
+                f"for {len(detections) - selected} remaining detections"
+            )
+        print(f"Embedding crop loading: {description}.", flush=True)
     else:
         print(
             f"Embedding crop loading: on demand with a {args.cache_crops}-crop RAM cache.",
@@ -1372,6 +1757,200 @@ def export_crop_samples(
         writer.writerows(rows)
     print(f"Exported {len(rows)} crop samples: {sample_dir}")
     return sample_dir
+
+
+def export_pair_samples(
+    output_dir,
+    sample_count,
+    detections,
+    metadata,
+    input_size,
+    background_store,
+    background_threshold,
+    background_morph_kernel,
+    preloaded_crop_store=None,
+    input_channels=1,
+    min_fragment_length=4,
+    seed=42,
+    training_fragments=None,
+):
+    """Export side-by-side examples of the fragment pairs used for training."""
+    _, track_to_label, original_indices_by_track, original_known_different = metadata
+    if training_fragments is None:
+        indices_by_track = original_indices_by_track
+        known_different = original_known_different
+    else:
+        indices_by_track = training_fragments.indices_by_fragment
+        known_different = training_fragments.known_different
+    eligible = sorted(
+        track
+        for track, indices in indices_by_track.items()
+        if len(indices) >= min_fragment_length
+    )
+    eligible_set = set(eligible)
+    negative_pairs = [
+        (first, int(second))
+        for first in eligible
+        for second in np.flatnonzero(known_different[first])
+        if first < second and int(second) in eligible_set
+    ]
+    if not eligible or not negative_pairs:
+        raise ValueError(
+            "Pair export requires eligible fragments and at least one coexisting "
+            "negative-fragment pair."
+        )
+
+    generator = np.random.default_rng(seed)
+
+    def choose_examples(values, weights):
+        count = min(sample_count, len(values))
+        probabilities = np.asarray(weights, dtype=np.float64)
+        probabilities /= probabilities.sum()
+        selected = generator.choice(
+            len(values), size=count, replace=False, p=probabilities
+        )
+        return [values[int(index)] for index in selected]
+
+    selected_positive = choose_examples(
+        [(track, track) for track in eligible],
+        [len(indices_by_track[track]) for track in eligible],
+    )
+    selected_negative = choose_examples(
+        negative_pairs,
+        [
+            len(indices_by_track[first]) + len(indices_by_track[second])
+            for first, second in negative_pairs
+        ],
+    )
+
+    pair_dir = Path(output_dir) / "pair_samples"
+    positive_dir = pair_dir / "positive"
+    negative_dir = pair_dir / "negative"
+    positive_dir.mkdir(parents=True, exist_ok=True)
+    negative_dir.mkdir(parents=True, exist_ok=True)
+    dataset = VideoCropDataset(
+        detections,
+        track_to_label,
+        input_size=input_size,
+        cache_size=0,
+        augment=False,
+        background_store=background_store,
+        background_threshold=background_threshold,
+        background_morph_kernel=background_morph_kernel,
+        preloaded_crop_store=preloaded_crop_store,
+        input_channels=input_channels,
+    )
+    frame_sets = {}
+
+    def frames_for_track(track):
+        if track not in frame_sets:
+            frame_sets[track] = {
+                detections[index].frame for index in indices_by_track[track]
+            }
+        return frame_sets[track]
+
+    def choose_detection(track, excluded=None):
+        candidates = indices_by_track[track]
+        index = int(generator.choice(candidates))
+        if excluded is not None and len(candidates) > 1:
+            while index == excluded:
+                index = int(generator.choice(candidates))
+        return index
+
+    def display_crop(crop):
+        if crop.shape[-1] == 1:
+            return cv2.cvtColor(crop[..., 0], cv2.COLOR_GRAY2BGR)
+        return cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+
+    rows = []
+    all_examples = (
+        [("positive", pair) for pair in selected_positive]
+        + [("negative", pair) for pair in selected_negative]
+    )
+    try:
+        for completed, (pair_type, (first_track, second_track)) in enumerate(
+            all_examples, start=1
+        ):
+            first_index = choose_detection(first_track)
+            second_index = choose_detection(
+                second_track, first_index if first_track == second_track else None
+            )
+            first_item = detections[first_index]
+            second_item = detections[second_index]
+            first_crop = display_crop(dataset._read_crop(first_index))
+            second_crop = display_crop(dataset._read_crop(second_index))
+            gap = 8
+            header = 38
+            canvas = np.zeros(
+                (input_size + header, 2 * input_size + gap, 3), dtype=np.uint8
+            )
+            canvas[header:, :input_size] = first_crop
+            canvas[header:, input_size + gap:] = second_crop
+            color = (80, 220, 80) if pair_type == "positive" else (80, 80, 240)
+            cv2.putText(
+                canvas,
+                f"{pair_type.upper()}  A:{first_item.track_id} f{first_item.frame}",
+                (3, 14),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.34,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                canvas,
+                f"B:{second_item.track_id} f{second_item.frame}",
+                (3, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.34,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+            type_number = sum(row["pair_type"] == pair_type for row in rows) + 1
+            relative_path = Path(pair_type) / f"pair_{type_number:03d}.png"
+            if not cv2.imwrite(str(pair_dir / relative_path), canvas):
+                raise RuntimeError(f"Could not write pair sample: {relative_path}")
+            shared_frames = len(
+                frames_for_track(first_track).intersection(
+                    frames_for_track(second_track)
+                )
+            )
+            rows.append(
+                {
+                    "pair_file": str(relative_path),
+                    "pair_type": pair_type,
+                    "training_fragment_a": first_track,
+                    "training_fragment_b": second_track,
+                    "shared_frame_count": shared_frames,
+                    "video_a": first_item.video,
+                    "frame_a": first_item.frame,
+                    "track_id_a": first_item.track_id,
+                    "bbox_a": ",".join(map(str, first_item.bbox)),
+                    "video_b": second_item.video,
+                    "frame_b": second_item.frame,
+                    "track_id_b": second_item.track_id,
+                    "bbox_b": ",".join(map(str, second_item.bbox)),
+                }
+            )
+            if completed % 50 == 0 or completed == len(all_examples):
+                print(
+                    f"  pair samples: {completed}/{len(all_examples)}",
+                    flush=True,
+                )
+    finally:
+        dataset.close()
+
+    manifest_path = pair_dir / "pair_samples.csv"
+    with manifest_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(
+        f"Exported {len(selected_positive)} positive and {len(selected_negative)} "
+        f"negative pair samples: {pair_dir}"
+    )
+    return pair_dir
 
 
 def _normalize_rows(values):
@@ -2059,7 +2638,14 @@ def build_parser():
     )
     parser.add_argument(
         "--mode",
-        choices=("train-predict", "train", "predict", "embed", "sample-crops"),
+        choices=(
+            "train-predict",
+            "train",
+            "predict",
+            "embed",
+            "sample-crops",
+            "sample-pairs",
+        ),
         default="train-predict",
         help="operation to perform",
     )
@@ -2077,7 +2663,7 @@ def build_parser():
     parser.add_argument("--output-dir", default="./contrastive_output")
     parser.add_argument(
         "--checkpoint",
-        help="trained network used by predict, embed, or sample-crops mode",
+        help="trained network used by predict, embed, or sampling modes",
     )
     parser.add_argument(
         "--init-checkpoint",
@@ -2093,6 +2679,17 @@ def build_parser():
         help=(
             "export evenly spaced, non-augmented network input crops; specifying "
             "the option without a count exports 100"
+        ),
+    )
+    parser.add_argument(
+        "--export-pair-samples",
+        nargs="?",
+        const=300,
+        type=int,
+        metavar="COUNT",
+        help=(
+            "export COUNT positive and COUNT negative training-pair examples; "
+            "specifying the option without a count exports 300 of each"
         ),
     )
     parser.add_argument(
@@ -2197,6 +2794,45 @@ def build_parser():
         help="minimum detections for a fragment to participate in pair training",
     )
     parser.add_argument(
+        "--training-fragments",
+        choices=("conservative", "tracks"),
+        default="conservative",
+        help=(
+            "split motion tracks around locally ambiguous events, or retain the "
+            "original whole tracks for comparison"
+        ),
+    )
+    parser.add_argument(
+        "--fragment-close-distance",
+        type=float,
+        default=0.75,
+        help="uncertain center distance in units of mean bounding-box size",
+    )
+    parser.add_argument(
+        "--fragment-assignment-margin",
+        type=float,
+        default=0.35,
+        help="maximum normalized direct-versus-swapped motion cost advantage",
+    )
+    parser.add_argument(
+        "--fragment-motion-jump",
+        type=float,
+        default=1.5,
+        help="maximum constant-velocity prediction error in box-size units",
+    )
+    parser.add_argument(
+        "--fragment-uncertainty-buffer",
+        type=int,
+        default=5,
+        help="observed frames discarded on each side of an ambiguous event",
+    )
+    parser.add_argument(
+        "--fragment-interpolation-gap",
+        type=int,
+        default=10,
+        help="maximum internal gap interpolated only for uncertainty detection",
+    )
+    parser.add_argument(
         "--validation-interval",
         type=int,
         help="optimizer steps between silhouette checks; auto is max(5*N, 100)",
@@ -2296,6 +2932,12 @@ def validate_args(args, parser):
         parser.error("--forward-pair-chunk-size must be at least 1")
     if args.min_fragment_length < 2:
         parser.error("--min-fragment-length must be at least 2")
+    if args.fragment_close_distance < 0 or args.fragment_assignment_margin < 0:
+        parser.error("fragment distance and assignment margin cannot be negative")
+    if args.fragment_motion_jump <= 0:
+        parser.error("--fragment-motion-jump must be greater than zero")
+    if args.fragment_uncertainty_buffer < 0 or args.fragment_interpolation_gap < 0:
+        parser.error("fragment buffer and interpolation gap cannot be negative")
     if args.validation_interval is not None and args.validation_interval < 1:
         parser.error("--validation-interval must be at least 1")
     if args.validation_warmup < 0 or args.validation_patience < 1:
@@ -2330,8 +2972,12 @@ def validate_args(args, parser):
         parser.error("--global-fragment-min-frames must be at least 1")
     if args.export_crop_samples is not None and args.export_crop_samples < 1:
         parser.error("--export-crop-samples must be at least 1")
+    if args.export_pair_samples is not None and args.export_pair_samples < 1:
+        parser.error("--export-pair-samples must be at least 1")
     if args.mode == "sample-crops" and args.export_crop_samples is None:
         args.export_crop_samples = 100
+    if args.mode == "sample-pairs" and args.export_pair_samples is None:
+        args.export_pair_samples = 300
     if args.preload_crops:
         if args.crop_storage != "auto":
             parser.error("Use either --preload-crops or --crop-storage, not both")
@@ -2357,6 +3003,37 @@ def main():
 
     detections, raw_rows = read_manifests(args.manifest, args.video)
     metadata = build_track_metadata(detections)
+    training_fragments = None
+    if args.mode in {"train", "train-predict", "sample-pairs"} or args.export_pair_samples:
+        if args.training_fragments == "conservative":
+            print("Building conservative contiguous training fragments...", flush=True)
+            training_fragments = build_conservative_training_fragments(
+                detections,
+                close_distance=args.fragment_close_distance,
+                assignment_margin=args.fragment_assignment_margin,
+                motion_jump=args.fragment_motion_jump,
+                uncertainty_buffer=args.fragment_uncertainty_buffer,
+                interpolation_gap=args.fragment_interpolation_gap,
+                min_fragment_length=args.min_fragment_length,
+            )
+        else:
+            training_fragments = use_original_tracks_as_training_fragments(metadata)
+        retained = sum(
+            len(indices)
+            for indices in training_fragments.indices_by_fragment.values()
+        )
+        print(
+            f"Training fragments: {len(training_fragments.keys)} fragments retain "
+            f"{retained}/{len(detections)} detections ({retained / len(detections):.1%}); "
+            f"{training_fragments.excluded_detection_count} detections excluded.",
+            flush=True,
+        )
+        fragment_summary = write_training_fragment_summary(
+            Path(args.output_dir) / "training_fragments.csv",
+            training_fragments,
+            detections,
+        )
+        print(f"Saved training fragment summary: {fragment_summary}")
     preloaded_crop_store = None
 
     if args.mode in {"train", "train-predict"}:
@@ -2367,6 +3044,7 @@ def main():
             device,
             background_store,
             preloaded_crop_store,
+            training_fragments,
         )
     else:
         model, _, _, input_size = make_model(args, device, args.checkpoint)
@@ -2392,7 +3070,35 @@ def main():
             model.input_channels,
         )
 
+    if args.export_pair_samples:
+        export_pair_samples(
+            args.output_dir,
+            args.export_pair_samples,
+            detections,
+            metadata,
+            input_size,
+            background_store,
+            args.background_threshold,
+            args.background_morph_kernel,
+            preloaded_crop_store,
+            model.input_channels,
+            args.min_fragment_length,
+            args.seed,
+            training_fragments,
+        )
+
     if args.mode in {"train-predict", "predict", "embed"}:
+        if (
+            preloaded_crop_store is not None
+            and len(preloaded_crop_store.detection_indices) < len(detections)
+        ):
+            print(
+                "Releasing the training-only crop cache; full-video embedding "
+                "will stream frames sequentially.",
+                flush=True,
+            )
+            preloaded_crop_store.release()
+            preloaded_crop_store = None
         run_inference(
             args,
             model,
