@@ -26,7 +26,8 @@ Current default BehaveAI implementation
 ----------------------------------------
 Network:
 * The same torchvision ResNet-18 structure used by idtracker.ai.
-* One-channel grayscale input, 96 x 96 pixels by default.
+* One-channel grayscale input, 96 x 96 pixels by default. RGB input is available
+  with --input-color rgb while preserving the same network and training path.
 * Direct 8-dimensional, unnormalized embedding with a bias-free final layer.
 * Adam optimizer at learning rate 0.001 by default.
 * --architecture small-cnn retains the previous RGB model, and checkpoints

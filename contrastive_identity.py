@@ -699,17 +699,23 @@ class IdentityEncoder(_ModuleBase):
 
 
 class IdtrackerResNet18(ResNet):
-    """The grayscale ResNet18 identity network used by idtracker.ai."""
+    """idtracker.ai's ResNet18 identity network with grayscale or RGB input."""
 
-    def __init__(self, embedding_dim=DEFAULT_IDTRACKER_EMBEDDING_DIM):
+    def __init__(
+        self, embedding_dim=DEFAULT_IDTRACKER_EMBEDDING_DIM, input_channels=1
+    ):
         if nn is None:
             require_torch()
         super().__init__(BasicBlock, [2, 2, 2, 2], num_classes=embedding_dim)
         self.architecture = "idtracker-resnet18"
-        self.input_channels = 1
-        self.conv1 = nn.Conv2d(
-            1, 64, kernel_size=7, stride=2, padding=3, bias=False
-        )
+        self.input_channels = input_channels
+        if input_channels != 3:
+            self.conv1 = nn.Conv2d(
+                input_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
+            )
+            nn.init.kaiming_normal_(
+                self.conv1.weight, mode="fan_out", nonlinearity="relu"
+            )
         self.fc = nn.Linear(512, embedding_dim, bias=False)
 
     def forward(self, images, project=True):
@@ -879,7 +885,12 @@ def make_model(args, device, checkpoint_path=None):
     projection_dim = stored.get("projection_dim", args.projection_dim)
     input_size = stored.get("input_size", args.input_size or DEFAULT_INPUT_SIZE)
     if architecture == "idtracker-resnet18":
-        model = IdtrackerResNet18(embedding_dim).to(device)
+        requested_color = getattr(args, "input_color", "grayscale")
+        input_channels = stored.get(
+            "input_channels",
+            1 if checkpoint else (1 if requested_color == "grayscale" else 3),
+        )
+        model = IdtrackerResNet18(embedding_dim, input_channels).to(device)
     else:
         model = IdentityEncoder(embedding_dim, projection_dim).to(device)
     if checkpoint:
@@ -1058,8 +1069,10 @@ def _train_idtracker_style(
     )
     loader = DataLoader(pair_dataset, batch_sampler=sampler, num_workers=0)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    input_color = "grayscale" if model.input_channels == 1 else "RGB"
     print(
-        f"idTracker-style training on {len(dataset)} detections from {len(eligible)} "
+        f"idTracker-style {input_color} training on {len(dataset)} detections "
+        f"from {len(eligible)} "
         f"eligible fragments ({len(negative_pairs)} negative and {len(eligible)} "
         f"positive fragment pairs) using {device}. Each optimizer step samples "
         f"{args.pairs_per_batch} pairs per class / {4 * args.pairs_per_batch} images."
@@ -2151,6 +2164,15 @@ def build_parser():
     )
     parser.add_argument("--projection-dim", type=int, default=64)
     parser.add_argument("--input-size", type=int)
+    parser.add_argument(
+        "--input-color",
+        choices=("grayscale", "rgb"),
+        default="grayscale",
+        help=(
+            "ResNet crop color mode; checkpoints restore their saved mode and the "
+            "legacy small-CNN remains RGB-only"
+        ),
+    )
     parser.add_argument(
         "--margin",
         type=float,
