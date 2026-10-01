@@ -1,0 +1,152 @@
+BehaveAI contrastive identity vs. idtracker.ai v6
+================================================
+
+Recorded: 2026-09-30
+
+Purpose
+-------
+This note records the important differences between our current
+contrastive_identity.py implementation and idtracker.ai v6. The current code
+is intentionally simpler, but these differences are useful candidates for
+future accuracy and performance work.
+
+
+What both systems do
+--------------------
+* Use continuous track fragments as weak identity supervision.
+* Treat images from the same fragment as positive examples.
+* Treat images from simultaneous/coexisting fragments as reliable negatives.
+* Learn an appearance embedding and cluster it into a known number of animals.
+* Use video structure so coexisting fragments cannot receive the same identity.
+* Use a complete coexisting group (a "global fragment") to initialize identity
+  clusters when one is available.
+
+
+Current BehaveAI implementation
+-------------------------------
+Network:
+* Small custom four-block CNN with 32, 64, 128, and 256 channels.
+* RGB input, 96 x 96 pixels by default (configurable with --input-size).
+* 128-dimensional normalized embedding.
+* Separate 64-dimensional normalized projection head used during training.
+* AdamW optimizer.
+
+Training batches and loss:
+* Default batch size is 128 images.
+* Default composition is 32 track fragments x 4 images per fragment.
+* Computes all usable relationships within the batch.
+* Positive loss is mean cosine distance between images from the same track.
+* Negative loss is a margin penalty for known-different coexisting tracks.
+* Relationships between nonoverlapping tracks are left unknown and excluded.
+* Sampling starts from an anchor track, adds its known negatives, and fills any
+  remaining batch positions with other tracks.
+* There is not yet adaptive hard-pair mining or silhouette-based early stopping.
+
+Crop handling:
+* Training crops are materialized sequentially by default.
+* Automatic storage uses uint8 RAM when there is enough headroom, otherwise a
+  disk-backed NumPy memory map. On-demand video seeking remains optional.
+* Median-background masking is optional; unmasked full bounding-box crops are
+  also supported.
+
+Clustering and assignment:
+* Cosine K-means operates on track-mean embeddings.
+* Detection embeddings then vote for a fragment-level identity distribution.
+* A complete coexisting track group initializes and anchors cluster identities
+  when all member tracks meet the minimum length.
+* Fragment probabilities are corrected using coexisting fragments, following
+  the basic idtracker.ai P1/P2 idea.
+* Fragments are assigned in confidence order.
+* Ambiguous or structurally impossible fragments are assigned -1 rather than
+  forcing an identity collision.
+* Original unconstrained K-means remains available as a comparison backend.
+
+
+idtracker.ai v6 implementation
+------------------------------
+Network:
+* ResNet-18.
+* Grayscale input.
+* Direct 8-dimensional embedding, with no separate projection head.
+* Adam optimizer.
+
+Training batches and loss:
+* Samples explicit pairs of fragments rather than constructing all relations
+  among a group of tracks.
+* Default batch contains 400 positive pairs and 400 negative pairs.
+* Each pair has two images, so the ResNet processes 1,600 images per optimizer
+  step (two forward calls of 800 images each).
+* Uses Euclidean pairwise contrastive loss: positives are pulled together and
+  negatives are pushed apart to a margin.
+* Sampling probabilities adapt using fragment sizes and recent pair losses.
+  This emphasizes pairs that the network is still getting wrong.
+* Training periodically clusters validation embeddings and measures silhouette
+  score. It stops at a target score or after a patience limit.
+
+Clustering and assignment:
+* MiniBatchKMeans clusters individual-image embeddings into exactly N animals.
+* When possible, centers are initialized from up to 500 images per animal from
+  a reference global fragment; otherwise it uses K-means++.
+* Image-level cluster frequencies become fragment P1 probabilities.
+* Coexisting-fragment evidence produces corrected P2 probabilities.
+* Fragments are assigned in descending P2 certainty, updating their neighbors
+  after each assignment.
+* Ambiguous fragments can remain unidentified.
+* Cluster labels are explicitly mapped/reordered into identity labels.
+* If contrastive assignment identifies too little of the video, the classical
+  iterative accumulation/idCNN protocol takes over using the contrastive result
+  as a warm start.
+
+
+Important current observations
+------------------------------
+Historical eight-animal test without background subtraction (do not treat its
+identity results as reliable: the source manifest was later found to contain
+multiple detections with the same track ID in a frame):
+* 893 track fragments and 89,582 detections.
+* 773 fragments assigned (86.56%).
+* 86,439 detections assigned (96.49%).
+* Mean assigned confidence: 0.803.
+* Zero assigned-identity collisions across 16,811 multi-detection frames.
+
+The zero-collision result verifies structural consistency, but it does not prove
+that identities remain correct across track breaks. The algorithm enforces the
+collision constraint and excludes -1/unassigned fragments from collision counts.
+The main unresolved accuracy question is whether nonoverlapping fragments from
+the same animal retain the same identity.
+
+
+Most promising future experiments
+----------------------------------
+1. Add visual and quantitative track-break continuity validation.
+2. Report per-identity detection/track counts and embedding separation.
+3. Compare masked and unmasked crops using the same train/validation split.
+4. Add silhouette monitoring and checkpoint the best embedding model rather
+   than always using the final epoch.
+5. Add adaptive hard positive/negative fragment-pair sampling.
+6. Compare the current CNN with a grayscale or RGB ResNet-18 while keeping the
+   assignment stage unchanged.
+7. Compare 8-D, 32-D, and 128-D embeddings; high-dimensional output is useful
+   for transfer, but idtracker.ai demonstrates that a compact identity space can
+   cluster very effectively.
+8. Try image-level MiniBatchKMeans instead of fitting centers only to track means.
+9. Add an optional accumulation/refinement stage for confidently assigned tracks.
+10. Keep clustering and identity assignment as separate interfaces so K-means,
+    GMM, agglomerative, graph-constrained, and unknown-N approaches can be tested
+    without changing embedding training.
+
+
+Interpretation of training output
+---------------------------------
+* positive_loss: mean same-track cosine distance; lower is better.
+* negative_loss: penalty for coexisting tracks inside the negative margin;
+  lower is better.
+* loss: positive_loss + negative_loss.
+These are not accuracies. Final performance should be judged with assignment
+coverage, collision checks, continuity across track breaks, visual inspection,
+and—when ground truth is available—identity accuracy.
+
+After fixing the tracker to prevent reuse of an already matched track ID, the
+video was retracked with frame_skip=0. The corrected manifest contains 357,651
+detections across 70,214 populated frames, 4,492 track fragments, and zero
+duplicate (video, frame, track_id) keys. A new contrastive run is still needed.

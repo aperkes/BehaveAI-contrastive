@@ -8,8 +8,10 @@ used as weak supervision:
 * tracks that coexist in at least one video frame are negative examples;
 * non-overlapping tracks are not assumed to be different animals.
 
-Pixels are read from the source video on demand. Resized crops are held in a
-bounded RAM cache, so no directory of crop images is required.
+For training, source videos are decoded sequentially once and resized crops are
+materialized as uint8 data. They are kept in RAM when space permits and in a
+disk-backed array otherwise. On-demand video access remains available as an
+explicit low-storage mode.
 
 Optional median-background masking estimates one background per source video
 from samples distributed across its full duration. The background pixels in
@@ -34,11 +36,14 @@ Typical commands::
 
 import argparse
 import csv
+import json
 import os
 import random
+import shutil
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 import cv2
 import numpy as np
@@ -61,7 +66,7 @@ else:
 
 
 DEFAULT_EMBEDDING_DIM = 128
-DEFAULT_INPUT_SIZE = 128
+DEFAULT_INPUT_SIZE = 96
 
 
 @dataclass(frozen=True)
@@ -103,6 +108,28 @@ def resolve_device(requested):
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def format_duration(seconds):
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes:d}m {seconds:02d}s"
+    return f"{seconds:d}s"
+
+
+def report_progress(label, completed, total, started_at):
+    elapsed = perf_counter() - started_at
+    rate = completed / elapsed if elapsed > 0 else 0.0
+    remaining = (total - completed) / rate if rate > 0 else 0.0
+    print(
+        f"  {label}: {completed}/{total} ({completed / total:.1%}), "
+        f"elapsed {format_duration(elapsed)}, ETA {format_duration(remaining)}",
+        flush=True,
+    )
 
 
 def read_manifests(manifest_paths, video_overrides=None):
@@ -157,8 +184,17 @@ def build_track_metadata(detections):
     track_to_label = {key: index for index, key in enumerate(track_keys)}
     indices_by_track = defaultdict(list)
     tracks_by_frame = defaultdict(set)
+    seen_track_frames = set()
 
     for index, item in enumerate(detections):
+        track_frame = (item.video, item.frame, item.track_id)
+        if track_frame in seen_track_frames:
+            raise ValueError(
+                "Invalid crop manifest: track "
+                f"{item.track_id} occurs more than once in frame {item.frame} of "
+                f"{item.video}. Regenerate it with one detection per track per frame."
+            )
+        seen_track_frames.add(track_frame)
         label = track_to_label[item.track_key]
         indices_by_track[label].append(index)
         tracks_by_frame[(item.video, item.frame)].add(label)
@@ -317,7 +353,7 @@ def prepare_detection_crop(
 
 
 class PreloadedCropStore:
-    """Decode each video sequentially once and retain fixed-size uint8 crops."""
+    """Decode videos once into a RAM array or disk-backed memory map."""
 
     def __init__(
         self,
@@ -326,13 +362,38 @@ class PreloadedCropStore:
         background_store=None,
         background_threshold=25,
         background_morph_kernel=3,
+        storage="auto",
+        cache_path=None,
     ):
         self.detections = detections
         self.input_size = input_size
         self.background_store = background_store
         self.background_threshold = background_threshold
         self.background_morph_kernel = background_morph_kernel
+        self.shape = (len(self.detections), self.input_size, self.input_size, 3)
+        self.required_bytes = int(np.prod(self.shape, dtype=np.int64))
+        self.cache_path = Path(cache_path) if cache_path is not None else None
+        self.storage = self._resolve_storage(storage)
         self.crops = None
+
+    def _resolve_storage(self, requested):
+        if requested != "auto":
+            return requested
+        try:
+            import psutil
+
+            available = psutil.virtual_memory().available
+        except ImportError:
+            available = 0
+        reserve = max(2 * 1024 ** 3, self.required_bytes // 4)
+        selected = "ram" if available >= self.required_bytes + reserve else "disk"
+        print(
+            f"Automatic crop storage selected {selected.upper()}: crops require "
+            f"{self.required_bytes / 1024 ** 3:.2f} GiB and "
+            f"{available / 1024 ** 3:.2f} GiB RAM is currently available.",
+            flush=True,
+        )
+        return selected
 
     def get(self, index):
         if self.crops is None:
@@ -340,10 +401,33 @@ class PreloadedCropStore:
         return self.crops[index]
 
     def _build(self):
-        shape = (len(self.detections), self.input_size, self.input_size, 3)
-        gib = np.prod(shape, dtype=np.int64) / 1024 ** 3
-        print(f"Preloading {len(self.detections)} crops into {gib:.2f} GiB of RAM...")
-        self.crops = np.empty(shape, dtype=np.uint8)
+        gib = self.required_bytes / 1024 ** 3
+        if self.storage == "ram":
+            print(f"Preloading {len(self.detections)} crops into {gib:.2f} GiB of RAM...")
+            self.crops = np.empty(self.shape, dtype=np.uint8)
+        elif self.storage == "disk":
+            if self.cache_path is None:
+                raise ValueError("A cache path is required for disk crop storage.")
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            free_bytes = shutil.disk_usage(self.cache_path.parent).free
+            if free_bytes < self.required_bytes:
+                raise RuntimeError(
+                    f"Disk crop cache requires {gib:.2f} GiB but only "
+                    f"{free_bytes / 1024 ** 3:.2f} GiB is free at "
+                    f"{self.cache_path.parent}. Use --crop-storage on-demand or free space."
+                )
+            print(
+                f"Saving {len(self.detections)} crops to a {gib:.2f} GiB "
+                f"memory-mapped cache: {self.cache_path}"
+            )
+            self.crops = np.lib.format.open_memmap(
+                self.cache_path,
+                mode="w+",
+                dtype=np.uint8,
+                shape=self.shape,
+            )
+        else:
+            raise ValueError(f"Unsupported crop storage mode: {self.storage}")
 
         detections_by_video_and_frame = defaultdict(lambda: defaultdict(list))
         for index, item in enumerate(self.detections):
@@ -381,7 +465,21 @@ class PreloadedCropStore:
                     print(f"  crop preload: {percent:.1f}%", flush=True)
                     next_report += 5
             capture.release()
+        if isinstance(self.crops, np.memmap):
+            self.crops.flush()
         print("Crop preload complete.")
+
+
+def make_preloaded_crop_store(args, detections, input_size, background_store):
+    return PreloadedCropStore(
+        detections,
+        input_size,
+        background_store,
+        args.background_threshold,
+        args.background_morph_kernel,
+        storage=args.crop_storage,
+        cache_path=Path(args.output_dir) / "crop_cache" / "crops.npy",
+    )
 
 
 class VideoCropDataset(Dataset):
@@ -651,13 +749,9 @@ def train_model(
     model, embedding_dim, projection_dim, input_size = make_model(
         args, device, args.init_checkpoint
     )
-    if args.preload_crops and preloaded_crop_store is None:
-        preloaded_crop_store = PreloadedCropStore(
-            detections,
-            input_size,
-            background_store,
-            args.background_threshold,
-            args.background_morph_kernel,
+    if args.crop_storage != "on-demand" and preloaded_crop_store is None:
+        preloaded_crop_store = make_preloaded_crop_store(
+            args, detections, input_size, background_store
         )
     dataset = VideoCropDataset(
         detections,
@@ -670,19 +764,34 @@ def train_model(
         background_morph_kernel=args.background_morph_kernel,
         preloaded_crop_store=preloaded_crop_store,
     )
+    effective_tracks_per_batch = min(args.tracks_per_batch, len(indices_by_track))
+    effective_batch_size = effective_tracks_per_batch * args.samples_per_track
     batches_per_epoch = args.batches_per_epoch or max(
-        1, int(np.ceil(len(detections) / (args.tracks_per_batch * args.samples_per_track)))
+        1, int(np.ceil(len(detections) / effective_batch_size))
     )
     sampler = TrackBatchSampler(
         indices_by_track,
         known_different,
-        args.tracks_per_batch,
+        effective_tracks_per_batch,
         args.samples_per_track,
         batches_per_epoch,
     )
     loader = DataLoader(dataset, batch_sampler=sampler, num_workers=0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     known_different_tensor = torch.from_numpy(known_different)
+
+    if preloaded_crop_store is not None:
+        print(
+            "Crop loading: sequentially materialize every resized crop in "
+            f"{preloaded_crop_store.storage.upper()} before the first training batch.",
+            flush=True,
+        )
+    else:
+        print(
+            f"Crop loading: on demand from video with a {args.cache_crops}-crop RAM "
+            "cache. Random video seeks can be slow.",
+            flush=True,
+        )
 
     if not known_different.any():
         print(
@@ -692,12 +801,16 @@ def train_model(
 
     print(
         f"Training on {len(detections)} detections from {len(track_keys)} tracks "
-        f"using {device}."
+        f"using {device}. Effective batch size: "
+        f"{effective_batch_size} images "
+        f"({effective_tracks_per_batch} tracks x {args.samples_per_track} samples)."
     )
     for epoch in range(1, args.epochs + 1):
         model.train()
         totals = np.zeros(3, dtype=float)
-        for images, labels, _ in loader:
+        epoch_started = perf_counter()
+        last_report = epoch_started
+        for batch_number, (images, labels, _) in enumerate(loader, start=1):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device)
             optimizer.zero_grad(set_to_none=True)
@@ -708,11 +821,20 @@ def train_model(
             loss.backward()
             optimizer.step()
             totals += (loss.item(), positive_loss.item(), negative_loss.item())
+            now = perf_counter()
+            if batch_number == 1 or batch_number == len(loader) or now - last_report >= 10:
+                report_progress(
+                    f"epoch {epoch:03d} batches",
+                    batch_number,
+                    len(loader),
+                    epoch_started,
+                )
+                last_report = now
 
         means = totals / len(loader)
         print(
             f"Epoch {epoch:03d}/{args.epochs}: loss={means[0]:.5f} "
-            f"positive={means[1]:.5f} negative={means[2]:.5f}"
+            f"positive_loss={means[1]:.5f} negative_loss={means[2]:.5f}"
         )
 
     output_dir = Path(args.output_dir)
@@ -771,10 +893,28 @@ def extract_embeddings(
     )
     embeddings = []
     model.eval()
+    if preloaded_crop_store is not None:
+        print("Embedding crop loading: preloaded RAM store.", flush=True)
+    else:
+        print(
+            f"Embedding crop loading: on demand with a {args.cache_crops}-crop RAM cache.",
+            flush=True,
+        )
+    extraction_started = perf_counter()
+    last_report = extraction_started
     with torch.no_grad():
-        for images, _, _ in loader:
+        for batch_number, (images, _, _) in enumerate(loader, start=1):
             vectors = model(images.to(device), project=False)
             embeddings.append(vectors.cpu().numpy())
+            now = perf_counter()
+            if batch_number == 1 or batch_number == len(loader) or now - last_report >= 10:
+                report_progress(
+                    "embedding batches",
+                    batch_number,
+                    len(loader),
+                    extraction_started,
+                )
+                last_report = now
     dataset.close()
     return np.concatenate(embeddings, axis=0)
 
@@ -792,50 +932,335 @@ def aggregate_tracks(embeddings, detections, track_to_label, track_count):
     return track_embeddings, counts
 
 
-def cluster_identities(track_embeddings, number_of_individuals, seed):
+def export_crop_samples(
+    output_dir,
+    sample_count,
+    detections,
+    track_to_label,
+    input_size,
+    background_store,
+    background_threshold,
+    background_morph_kernel,
+    preloaded_crop_store=None,
+):
+    """Export deterministic, non-augmented examples of network input crops."""
+    sample_count = min(sample_count, len(detections))
+    indices = np.unique(
+        np.linspace(0, len(detections) - 1, sample_count, dtype=np.int64)
+    )
+    sample_dir = Path(output_dir) / "crop_samples"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    dataset = VideoCropDataset(
+        detections,
+        track_to_label,
+        input_size=input_size,
+        cache_size=0,
+        augment=False,
+        background_store=background_store,
+        background_threshold=background_threshold,
+        background_morph_kernel=background_morph_kernel,
+        preloaded_crop_store=preloaded_crop_store,
+    )
+    rows = []
+    try:
+        for sample_number, index in enumerate(indices, start=1):
+            item = detections[int(index)]
+            safe_track_id = "".join(
+                character if character.isalnum() or character in "-_" else "_"
+                for character in item.track_id
+            )
+            filename = (
+                f"sample_{sample_number:03d}_frame_{item.frame}_"
+                f"track_{safe_track_id}.png"
+            )
+            crop = dataset._read_crop(int(index))
+            if not cv2.imwrite(
+                str(sample_dir / filename), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+            ):
+                raise RuntimeError(f"Could not write crop sample: {sample_dir / filename}")
+            rows.append(
+                {
+                    "crop_file": filename,
+                    "source_video": item.video,
+                    "frame": item.frame,
+                    "track_id": item.track_id,
+                    "x1": item.bbox[0],
+                    "y1": item.bbox[1],
+                    "x2": item.bbox[2],
+                    "y2": item.bbox[3],
+                }
+            )
+    finally:
+        dataset.close()
+
+    manifest_path = sample_dir / "crop_samples.csv"
+    with manifest_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Exported {len(rows)} crop samples: {sample_dir}")
+    return sample_dir
+
+
+def _normalize_rows(values):
+    values = np.asarray(values, dtype=np.float32)
+    return values / np.maximum(np.linalg.norm(values, axis=1, keepdims=True), 1e-12)
+
+
+def cosine_kmeans(
+    vectors,
+    number_of_individuals,
+    seed,
+    initial_centers=None,
+    restarts=20,
+):
+    """Cluster unit vectors and return assignments, centers, and similarities."""
     if number_of_individuals < 1:
         raise ValueError("--num-individuals must be at least 1.")
-    if number_of_individuals > len(track_embeddings):
+    if number_of_individuals > len(vectors):
         raise ValueError(
             f"Requested {number_of_individuals} individuals but only "
-            f"{len(track_embeddings)} tracks are available."
+            f"{len(vectors)} tracks are available."
         )
 
-    # The embeddings are unit normalized, so cosine k-means is a natural fit
-    # and avoids adding a scikit-learn dependency to the BehaveAI environment.
+    vectors = _normalize_rows(vectors)
     generator = np.random.default_rng(seed)
     best_assignments = None
+    best_centers = None
     best_cost = np.inf
-    for _ in range(20):
-        initial = generator.choice(
-            len(track_embeddings), size=number_of_individuals, replace=False
-        )
-        centers = track_embeddings[initial].copy()
-        assignments = np.full(len(track_embeddings), -1, dtype=np.int64)
+    attempts = 1 if initial_centers is not None else restarts
+    for _ in range(attempts):
+        if initial_centers is None:
+            initial = generator.choice(
+                len(vectors), size=number_of_individuals, replace=False
+            )
+            centers = vectors[initial].copy()
+        else:
+            centers = _normalize_rows(initial_centers)
+        assignments = np.full(len(vectors), -1, dtype=np.int64)
 
         for _ in range(200):
-            similarities = track_embeddings @ centers.T
+            similarities = vectors @ centers.T
             updated = similarities.argmax(axis=1)
             if np.array_equal(updated, assignments):
                 break
             assignments = updated
 
             for identity in range(number_of_individuals):
-                members = track_embeddings[assignments == identity]
+                members = vectors[assignments == identity]
                 if len(members):
                     center = members.mean(axis=0)
                 else:
                     # Re-seed an empty cluster with the least well represented track.
-                    center = track_embeddings[np.argmin(similarities.max(axis=1))]
+                    center = vectors[np.argmin(similarities.max(axis=1))]
                 centers[identity] = center / max(np.linalg.norm(center), 1e-12)
 
-        similarities = track_embeddings @ centers.T
+        similarities = vectors @ centers.T
         cost = float(np.sum(1.0 - similarities[np.arange(len(assignments)), assignments]))
         if cost < best_cost:
             best_cost = cost
             best_assignments = assignments.copy()
+            best_centers = centers.copy()
 
-    return best_assignments
+    similarities = vectors @ best_centers.T
+    return best_assignments, best_centers, similarities
+
+
+def cluster_identities(track_embeddings, number_of_individuals, seed):
+    """Original unconstrained track-level clustering baseline."""
+    assignments, _, _ = cosine_kmeans(
+        track_embeddings, number_of_individuals, seed
+    )
+    return assignments
+
+
+def find_reference_global_fragment(
+    detections,
+    track_to_label,
+    number_of_individuals,
+    minimum_frames,
+):
+    """Return the strongest full-animal group whose tracks are long enough."""
+    tracks_by_frame = defaultdict(set)
+    track_lengths = defaultdict(int)
+    for item in detections:
+        label = track_to_label[item.track_key]
+        tracks_by_frame[(item.video, item.frame)].add(label)
+        track_lengths[label] += 1
+
+    frames_by_group = defaultdict(list)
+    for frame_key, labels in tracks_by_frame.items():
+        if len(labels) == number_of_individuals:
+            frames_by_group[(frame_key[0], tuple(sorted(labels)))].append(frame_key[1])
+
+    candidates = [
+        (key, frames)
+        for key, frames in frames_by_group.items()
+        if min(track_lengths[label] for label in key[1]) >= minimum_frames
+    ]
+    if not candidates:
+        return None
+    (video, labels), frames = max(
+        candidates,
+        key=lambda item: (
+            len(item[1]),
+            min(track_lengths[label] for label in item[0][1]),
+        ),
+    )
+    return {
+        "video": video,
+        "track_labels": labels,
+        "coexisting_frame_count": len(frames),
+        "minimum_track_detections": min(track_lengths[label] for label in labels),
+        "first_frame": min(frames),
+        "last_frame": max(frames),
+    }
+
+
+def fragment_identity_probabilities(
+    detection_assignments,
+    detection_track_labels,
+    track_count,
+    number_of_individuals,
+):
+    """Convert per-image cluster votes into idtracker-style fragment P1 values."""
+    frequencies = np.zeros((track_count, number_of_individuals), dtype=np.float64)
+    np.add.at(frequencies, (detection_track_labels, detection_assignments), 1)
+    logits = frequencies * np.log(2.0)
+    logits -= logits.max(axis=1, keepdims=True)
+    probabilities = np.exp(logits)
+    probabilities /= probabilities.sum(axis=1, keepdims=True)
+    return probabilities
+
+
+def assign_with_cooccurrence(p1, known_different, fixed_assignments=None):
+    """Assign fragments in confidence order while enforcing temporal exclusivity."""
+    p1 = np.asarray(p1, dtype=np.float64).copy()
+    track_count, number_of_individuals = p1.shape
+    assignments = np.full(track_count, -1, dtype=np.int64)
+    confidences = np.zeros(track_count, dtype=np.float64)
+    remaining = set(range(track_count))
+
+    for track, identity in (fixed_assignments or {}).items():
+        assignments[track] = identity
+        confidences[track] = 1.0
+        p1[track] = 0.0
+        p1[track, identity] = 1.0
+        remaining.discard(track)
+
+    while remaining:
+        best = None
+        for track in remaining:
+            neighbors = np.flatnonzero(known_different[track])
+            if len(neighbors):
+                adjusted = p1[track] * np.prod(1.0 - p1[neighbors], axis=0)
+            else:
+                adjusted = p1[track].copy()
+            total = adjusted.sum()
+            if total > 0:
+                adjusted /= total
+            ordered = np.sort(adjusted)
+            certainty = (
+                np.inf
+                if number_of_individuals == 1 or ordered[-2] == 0 < ordered[-1]
+                else (ordered[-1] / ordered[-2] if ordered[-2] > 0 else 0.0)
+            )
+            candidate = (certainty, float(adjusted.max()), -track, track, adjusted)
+            if best is None or candidate[:3] > best[:3]:
+                best = candidate
+
+        _, max_probability, _, track, adjusted = best
+        winners = np.flatnonzero(np.isclose(adjusted, max_probability))
+        if max_probability > 0 and len(winners) == 1:
+            identity = int(winners[0])
+            assignments[track] = identity
+            confidences[track] = max_probability
+            p1[track] = 0.0
+            p1[track, identity] = 1.0
+        remaining.remove(track)
+
+    return assignments, confidences
+
+
+def enforce_identity_exclusivity(assignments, confidences, known_different):
+    """Hard final guard: coexisting fragments may not retain the same identity."""
+    assignments = np.asarray(assignments, dtype=np.int64).copy()
+    confidences = np.asarray(confidences, dtype=np.float64).copy()
+    demoted = []
+    for identity in sorted(set(assignments[assignments >= 0].tolist())):
+        candidates = np.flatnonzero(assignments == identity)
+        candidates = sorted(candidates, key=lambda track: (-confidences[track], track))
+        accepted = []
+        for track in candidates:
+            if accepted and known_different[track, accepted].any():
+                assignments[track] = -1
+                confidences[track] = 0.0
+                demoted.append(track)
+            else:
+                accepted.append(track)
+
+    assigned_tracks = np.flatnonzero(assignments >= 0)
+    for position, first in enumerate(assigned_tracks):
+        conflicts = assigned_tracks[position + 1 :]
+        same_identity = assignments[conflicts] == assignments[first]
+        assert not known_different[first, conflicts[same_identity]].any()
+    return assignments, confidences, demoted
+
+
+def idtracker_identity_assignment(
+    embeddings,
+    track_embeddings,
+    detections,
+    track_to_label,
+    known_different,
+    number_of_individuals,
+    seed,
+    global_fragment_min_frames,
+):
+    """Cluster detections, then assign whole fragments using video constraints."""
+    reference = find_reference_global_fragment(
+        detections,
+        track_to_label,
+        number_of_individuals,
+        global_fragment_min_frames,
+    )
+    initial_centers = None
+    fixed_assignments = {}
+    if reference is not None:
+        initial_centers = track_embeddings[list(reference["track_labels"])]
+        fixed_assignments = {
+            track: identity
+            for identity, track in enumerate(reference["track_labels"])
+        }
+
+    _, centers, _ = cosine_kmeans(
+        track_embeddings,
+        number_of_individuals,
+        seed,
+        initial_centers=initial_centers,
+    )
+    detection_assignments = (_normalize_rows(embeddings) @ centers.T).argmax(axis=1)
+    detection_track_labels = np.asarray(
+        [track_to_label[item.track_key] for item in detections], dtype=np.int64
+    )
+    p1 = fragment_identity_probabilities(
+        detection_assignments,
+        detection_track_labels,
+        len(track_embeddings),
+        number_of_individuals,
+    )
+    assignments, confidences = assign_with_cooccurrence(
+        p1, known_different, fixed_assignments
+    )
+    assignments, confidences, demoted = enforce_identity_exclusivity(
+        assignments, confidences, known_different
+    )
+    if demoted:
+        print(
+            f"Final identity-exclusivity guard demoted {len(demoted)} conflicting "
+            "track fragments to -1."
+        )
+    return assignments, confidences, p1, reference
 
 
 def project_embeddings(
@@ -980,6 +1405,79 @@ def write_track_latents(
             writer.writerow(row)
 
 
+def write_assignment_diagnostics(
+    path,
+    track_keys,
+    counts,
+    assignments,
+    confidences,
+    p1=None,
+):
+    path = Path(path)
+    fields = [
+        "source_video",
+        "track_id",
+        "detection_count",
+        "predicted_identity",
+        "assignment_confidence",
+    ]
+    if p1 is not None:
+        fields.extend(f"cluster_probability_{index}" for index in range(p1.shape[1]))
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(fields)
+        for label, (video, track_id) in enumerate(track_keys):
+            row = [
+                video,
+                track_id,
+                int(counts[label]),
+                int(assignments[label]),
+                f"{confidences[label]:.8g}",
+            ]
+            if p1 is not None:
+                row.extend(f"{value:.8g}" for value in p1[label])
+            writer.writerow(row)
+
+
+def assignment_quality(detections, track_to_label, assignments, confidences, reference):
+    tracks_by_frame = defaultdict(set)
+    for item in detections:
+        tracks_by_frame[(item.video, item.frame)].add(track_to_label[item.track_key])
+
+    multi_frames = 0
+    collision_frames = 0
+    for labels in tracks_by_frame.values():
+        if len(labels) < 2:
+            continue
+        multi_frames += 1
+        identities = [assignments[label] for label in labels if assignments[label] >= 0]
+        if len(identities) != len(set(identities)):
+            collision_frames += 1
+
+    assigned = assignments >= 0
+    assigned_detections = sum(
+        assignments[track_to_label[item.track_key]] >= 0 for item in detections
+    )
+    return {
+        "track_count": int(len(assignments)),
+        "assigned_tracks": int(assigned.sum()),
+        "unassigned_tracks": int((~assigned).sum()),
+        "assigned_track_fraction": float(assigned.mean()),
+        "detection_count": int(len(detections)),
+        "assigned_detections": int(assigned_detections),
+        "assigned_detection_fraction": float(assigned_detections / len(detections)),
+        "mean_assigned_confidence": (
+            float(confidences[assigned].mean()) if assigned.any() else 0.0
+        ),
+        "multi_detection_frames": int(multi_frames),
+        "identity_collision_frames": int(collision_frames),
+        "identity_collision_frame_fraction": (
+            float(collision_frames / multi_frames) if multi_frames else 0.0
+        ),
+        "reference_global_fragment": reference,
+    }
+
+
 def run_inference(
     args,
     model,
@@ -991,7 +1489,7 @@ def run_inference(
     background_store,
     preloaded_crop_store,
 ):
-    track_keys, track_to_label, _, _ = metadata
+    track_keys, track_to_label, _, known_different = metadata
     embeddings = extract_embeddings(
         args,
         model,
@@ -1012,12 +1510,68 @@ def run_inference(
     if args.mode != "embed":
         if args.num_individuals is None:
             raise ValueError("--num-individuals is required when predicting identities.")
-        identity_by_track = cluster_identities(track_embeddings, args.num_individuals, args.seed)
+        if args.identity_assignment == "idtracker":
+            identity_by_track, assignment_confidence, p1, reference = (
+                idtracker_identity_assignment(
+                    embeddings,
+                    track_embeddings,
+                    detections,
+                    track_to_label,
+                    known_different,
+                    args.num_individuals,
+                    args.seed,
+                    args.global_fragment_min_frames,
+                )
+            )
+            if reference is None:
+                print(
+                    "No sufficiently large full-animal frame group was found; "
+                    "using K-means++ initialization with co-occurrence-aware assignment."
+                )
+            else:
+                print(
+                    "Initialized identities from a reference group containing "
+                    "all animals; its shortest track has "
+                    f"{reference['minimum_track_detections']} detections."
+                )
+        else:
+            identity_by_track = cluster_identities(
+                track_embeddings, args.num_individuals, args.seed
+            )
+            assignment_confidence = np.ones(len(track_embeddings), dtype=np.float64)
+            p1 = None
+            reference = None
         identity_path = output_dir / "identity_predictions.csv"
         write_identity_rows(
             identity_path, raw_rows, detections, track_to_label, identity_by_track
         )
+        diagnostics_path = output_dir / "identity_assignment_tracks.csv"
+        write_assignment_diagnostics(
+            diagnostics_path,
+            track_keys,
+            track_counts,
+            identity_by_track,
+            assignment_confidence,
+            p1,
+        )
+        quality = assignment_quality(
+            detections,
+            track_to_label,
+            identity_by_track,
+            assignment_confidence,
+            reference,
+        )
+        quality["assignment_method"] = args.identity_assignment
+        quality_path = output_dir / "identity_assignment_quality.json"
+        quality_path.write_text(json.dumps(quality, indent=2), encoding="utf-8")
         print(f"Saved identity predictions: {identity_path}")
+        print(f"Saved assignment diagnostics: {diagnostics_path}")
+        print(f"Saved assignment quality report: {quality_path}")
+        print(
+            f"Assigned {quality['assigned_tracks']}/{quality['track_count']} tracks; "
+            f"identity collisions occur in "
+            f"{quality['identity_collision_frame_fraction']:.1%} of multi-detection frames."
+        )
 
     if args.mode == "embed" or args.export_latents:
         latent_path = Path(args.export_latents) if args.export_latents else output_dir / "latents.csv"
@@ -1069,7 +1623,7 @@ def build_parser():
     )
     parser.add_argument(
         "--mode",
-        choices=("train-predict", "train", "predict", "embed"),
+        choices=("train-predict", "train", "predict", "embed", "sample-crops"),
         default="train-predict",
         help="operation to perform",
     )
@@ -1085,12 +1639,44 @@ def build_parser():
         help="source video override; provide one per manifest, or use paths stored in manifests",
     )
     parser.add_argument("--output-dir", default="./contrastive_output")
-    parser.add_argument("--checkpoint", help="trained network used by predict or embed mode")
+    parser.add_argument(
+        "--checkpoint",
+        help="trained network used by predict, embed, or sample-crops mode",
+    )
     parser.add_argument(
         "--init-checkpoint",
         help="network used to initialize training on the supplied data",
     )
     parser.add_argument("--num-individuals", type=int, help="number of identity clusters")
+    parser.add_argument(
+        "--export-crop-samples",
+        nargs="?",
+        const=100,
+        type=int,
+        metavar="COUNT",
+        help=(
+            "export evenly spaced, non-augmented network input crops; specifying "
+            "the option without a count exports 100"
+        ),
+    )
+    parser.add_argument(
+        "--identity-assignment",
+        choices=("idtracker", "kmeans"),
+        default="idtracker",
+        help=(
+            "identity assignment strategy; idtracker aggregates detection votes and "
+            "enforces that coexisting tracks have different identities"
+        ),
+    )
+    parser.add_argument(
+        "--global-fragment-min-frames",
+        type=int,
+        default=30,
+        help=(
+            "minimum detections required in every track of a complete coexisting "
+            "track group before it can initialize and anchor identity clusters"
+        ),
+    )
     parser.add_argument(
         "--export-latents",
         metavar="CSV",
@@ -1133,7 +1719,23 @@ def build_parser():
     parser.add_argument("--projection-dim", type=int, default=64)
     parser.add_argument("--input-size", type=int)
     parser.add_argument("--margin", type=float, default=0.5)
-    parser.add_argument("--tracks-per-batch", type=int, default=8)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=128,
+        help=(
+            "total images in each training batch; must be divisible by "
+            "--samples-per-track"
+        ),
+    )
+    parser.add_argument(
+        "--tracks-per-batch",
+        type=int,
+        help=(
+            "advanced override for the number of tracks per batch; when supplied, "
+            "the effective batch size is this value times --samples-per-track"
+        ),
+    )
     parser.add_argument("--samples-per-track", type=int, default=4)
     parser.add_argument(
         "--batches-per-epoch",
@@ -1141,6 +1743,15 @@ def build_parser():
         help="automatic when omitted",
     )
     parser.add_argument("--inference-batch-size", type=int, default=128)
+    parser.add_argument(
+        "--crop-storage",
+        choices=("auto", "ram", "disk", "on-demand"),
+        default="auto",
+        help=(
+            "training crop storage: auto uses RAM when enough is available and a "
+            "disk memory map otherwise; on-demand retains the old video-seeking behavior"
+        ),
+    )
     parser.add_argument(
         "--cache-crops",
         type=int,
@@ -1151,8 +1762,8 @@ def build_parser():
         "--preload-crops",
         action="store_true",
         help=(
-            "decode videos sequentially once and retain every resized uint8 crop in RAM; "
-            "much faster for training when sufficient memory is available"
+            "compatibility alias for --crop-storage ram; automatic RAM/disk crop "
+            "materialization is now the default"
         ),
     )
     parser.add_argument(
@@ -1194,7 +1805,13 @@ def validate_args(args, parser):
         parser.error("Use --init-checkpoint, not --checkpoint, when training.")
     if args.samples_per_track < 2:
         parser.error("--samples-per-track must be at least 2 to form positive pairs")
-    if args.tracks_per_batch < 1:
+    if args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
+    if args.tracks_per_batch is None:
+        if args.batch_size % args.samples_per_track:
+            parser.error("--batch-size must be divisible by --samples-per-track")
+        args.tracks_per_batch = args.batch_size // args.samples_per_track
+    elif args.tracks_per_batch < 1:
         parser.error("--tracks-per-batch must be at least 1")
     if args.background_samples is not None and args.background_samples < 1:
         parser.error("--background-samples must be at least 1")
@@ -1210,6 +1827,16 @@ def validate_args(args, parser):
         parser.error("--umap-neighbors must be at least 2")
     if not 0 <= args.umap_min_dist:
         parser.error("--umap-min-dist cannot be negative")
+    if args.global_fragment_min_frames < 1:
+        parser.error("--global-fragment-min-frames must be at least 1")
+    if args.export_crop_samples is not None and args.export_crop_samples < 1:
+        parser.error("--export-crop-samples must be at least 1")
+    if args.mode == "sample-crops" and args.export_crop_samples is None:
+        args.export_crop_samples = 100
+    if args.preload_crops:
+        if args.crop_storage != "auto":
+            parser.error("Use either --preload-crops or --crop-storage, not both")
+        args.crop_storage = "ram"
 
 
 def main():
@@ -1244,14 +1871,26 @@ def main():
         )
     else:
         model, _, _, input_size = make_model(args, device, args.checkpoint)
-        if args.preload_crops:
-            preloaded_crop_store = PreloadedCropStore(
-                detections,
-                input_size,
-                background_store,
-                args.background_threshold,
-                args.background_morph_kernel,
+        # A single inference pass is already ordered by the manifest, so AUTO does
+        # not spend time and storage materializing every crop. Explicit RAM or disk
+        # modes remain available when repeated access is desired.
+        if args.crop_storage in {"ram", "disk"}:
+            preloaded_crop_store = make_preloaded_crop_store(
+                args, detections, input_size, background_store
             )
+
+    if args.export_crop_samples:
+        export_crop_samples(
+            args.output_dir,
+            args.export_crop_samples,
+            detections,
+            metadata[1],
+            input_size,
+            background_store,
+            args.background_threshold,
+            args.background_morph_kernel,
+            preloaded_crop_store,
+        )
 
     if args.mode in {"train-predict", "predict", "embed"}:
         run_inference(
