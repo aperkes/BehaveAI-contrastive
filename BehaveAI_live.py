@@ -471,20 +471,24 @@ class CameraProcessor:
 	def _orient_conf(self, model, img):
 		"""Probability the given whole crop is in the 'correct' (head-left, tail-right)
 		orientation, per the per-primary-class orientation classifier."""
-		if img is None or img.size == 0:
-			return 0.0
-		res = model.predict(img, verbose=False)
-		probs = res[0].probs
-		if probs is None:
-			return 0.0
+		return self._orient_confs(model, [img])[0]
+
+	def _orient_confs(self, model, images):
+		"""Return 'correct' confidence for a batch of orientation crops."""
 		correct_idx = None
 		for idx, name in model.names.items():
 			if name == 'correct':
 				correct_idx = idx
 				break
 		if correct_idx is None:
-			return 0.0
-		return float(probs.data[correct_idx])
+			return [0.0] * len(images)
+		if any(img is None or img.size == 0 for img in images):
+			return [0.0] * len(images)
+		results = model.predict(images, verbose=False)
+		return [
+			0.0 if result.probs is None else float(result.probs.data[correct_idx])
+			for result in results
+		]
 
 	def _disambiguate_head_tail(self, crop_img, head, tail, width, primary_class, is_motion):
 		"""Resolve both the mod-180 direction ambiguity AND which axis is actually the head-tail
@@ -496,7 +500,11 @@ class CameraProcessor:
 		model = (self.ornt_motion_models if is_motion else self.ornt_static_models).get(primary_class)
 		if model is None:
 			return head, tail, width
-		return bg.best_head_tail_orientation(crop_img, head, tail, width, lambda img: self._orient_conf(model, img))
+		return bg.best_head_tail_orientation(
+			crop_img, head, tail, width,
+			lambda img: self._orient_conf(model, img),
+			lambda images: self._orient_confs(model, images),
+		)
 
 	# ~ def set_camera(self, index):
 		# ~ with self.frame_lock:

@@ -514,15 +514,24 @@ def initialize_models():
 
 
 def _orient_conf(model, image):
-    if image is None or image.size == 0:
-        return 0.0
-    result = model.predict(image, verbose=False)[0]
-    if result.probs is None:
-        return 0.0
+    return _orient_confs(model, [image])[0]
+
+
+def _orient_confs(model, images):
+    """Return 'correct' confidence for a batch of orientation crops."""
     correct_index = next(
         (index for index, name in model.names.items() if name == 'correct'), None
     )
-    return 0.0 if correct_index is None else float(result.probs.data[correct_index])
+    if correct_index is None:
+        return [0.0] * len(images)
+    valid_images = [image for image in images if image is not None and image.size]
+    if len(valid_images) != len(images):
+        return [0.0] * len(images)
+    results = model.predict(valid_images, verbose=False)
+    return [
+        0.0 if result.probs is None else float(result.probs.data[correct_index])
+        for result in results
+    ]
 
 
 def _disambiguate_head_tail(image, head, tail, width, primary_class, is_motion):
@@ -533,7 +542,12 @@ def _disambiguate_head_tail(image, head, tail, width, primary_class, is_motion):
     if model is None:
         return head, tail, width
     return bg.best_head_tail_orientation(
-        image, head, tail, width, lambda crop: _orient_conf(model, crop)
+        image,
+        head,
+        tail,
+        width,
+        lambda crop: _orient_conf(model, crop),
+        lambda crops: _orient_confs(model, crops),
     )
 
 # --- PARAMETERS -----------------------------------------------------------

@@ -520,7 +520,7 @@ def crop_black_masked(img, corners):
 
 
 def crop_rotated_upright(img, head, tail, width):
-	"""Rotation-corrected crop: head at the left edge, tail at the right edge, no padding."""
+	"""Rotation-corrected tight crop: head left, tail right, no full-frame warp."""
 	hx, hy = head; tx, ty = tail
 	length = math.hypot(hx - tx, hy - ty)
 	if length < 1.0 or width < 1.0:
@@ -530,14 +530,26 @@ def crop_rotated_upright(img, head, tail, width):
 	angle_deg = math.degrees(theta) - 180.0  # rotates tail->head to point along -x (head ends up on the left)
 	M = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
 	h_img, w_img = img.shape[:2]
-	rotated = cv2.warpAffine(img, M, (w_img, h_img), flags=cv2.INTER_LINEAR)
 	x1 = int(round(cx - length / 2.0)); y1 = int(round(cy - width / 2.0))
 	x2 = int(round(cx + length / 2.0)); y2 = int(round(cy + width / 2.0))
 	x1, y1 = max(0, x1), max(0, y1)
 	x2, y2 = min(w_img, x2), min(h_img, y2)
 	if x2 <= x1 or y2 <= y1:
 		return None
-	return rotated[y1:y2, x1:x2]
+	# The old implementation warped the entire source frame and sliced this
+	# rectangle afterward. Translating the same affine transform into a tight
+	# output canvas produces the same crop without resampling millions of
+	# unrelated background pixels for every orientation hypothesis.
+	M[0, 2] -= x1
+	M[1, 2] -= y1
+	return cv2.warpAffine(
+		img,
+		M,
+		(x2 - x1, y2 - y1),
+		flags=cv2.INTER_LINEAR,
+		borderMode=cv2.BORDER_CONSTANT,
+		borderValue=0,
+	)
 
 
 def rotate_90_variants(img):
@@ -567,7 +579,14 @@ def swap_axis_hypothesis(head, tail, width):
 	return new_head, new_tail, length
 
 
-def best_head_tail_orientation(crop_img, head, tail, width, orient_conf_fn):
+def best_head_tail_orientation(
+	crop_img,
+	head,
+	tail,
+	width,
+	orient_conf_fn,
+	orient_conf_batch_fn=None,
+):
 	"""Resolve both the head/tail direction AND which axis is actually the head-tail axis, by
 	trying all 4 hypotheses (original axis x2 directions, perpendicular axis x2 directions) and
 	keeping whichever one's whole canonical upright-crop scores highest under
@@ -581,14 +600,22 @@ def best_head_tail_orientation(crop_img, head, tail, width, orient_conf_fn):
 		(head2, tail2, width2),
 		(tail2, head2, width2),
 	]
-	best = None
-	best_conf = -1.0
-	for h, t, w in candidates:
-		upright = crop_rotated_upright(crop_img, h, t, w)
-		if upright is None or upright.size == 0:
-			continue
-		conf = orient_conf_fn(upright)
-		if conf > best_conf:
-			best_conf = conf
-			best = (h, t, w)
-	return best if best is not None else (head, tail, width)
+	# All four candidates are rotations of the same physical OBB. Extract it
+	# once, then rotate the small crop instead of warping the full frame four
+	# times. Candidate order matches the geometry hypotheses above.
+	upright = crop_rotated_upright(crop_img, head, tail, width)
+	if upright is None or upright.size == 0:
+		return head, tail, width
+	images = [upright]
+	clockwise, opposite, counterclockwise = rotate_90_variants(upright)
+	images.extend((opposite, counterclockwise, clockwise))
+
+	if orient_conf_batch_fn is not None:
+		confidences = list(orient_conf_batch_fn(images))
+		if len(confidences) != len(candidates):
+			raise ValueError(
+				"Orientation batch classifier returned an unexpected number of scores."
+			)
+	else:
+		confidences = [orient_conf_fn(image) for image in images]
+	return candidates[int(np.argmax(confidences))]
