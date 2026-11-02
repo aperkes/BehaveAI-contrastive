@@ -3,7 +3,6 @@ import numpy as np
 import csv
 import os
 import glob
-from ultralytics import YOLO
 from scipy.optimize import linear_sum_assignment
 import configparser
 import time
@@ -13,6 +12,19 @@ from tkinter import messagebox
 import subprocess
 import time
 import sys
+import argparse
+
+
+YOLO = None
+
+
+def load_runtime_dependencies():
+    """Import model libraries only after argparse has handled help/errors."""
+    global YOLO
+    if YOLO is None:
+        from ultralytics import YOLO as ultralytics_yolo
+
+        YOLO = ultralytics_yolo
 
 
 # --- NCNN helper utilities -----------------------
@@ -103,138 +115,184 @@ def load_model_with_ncnn_preference(weights_path):
 
 
 
-# Load configuration
-config = configparser.ConfigParser()
-config_path = 'BehaveAI_settings.ini'
-if not os.path.exists(config_path):
-    raise FileNotFoundError(f"Configuration file not found: {config_path}")
-config.read(config_path)
+def resolve_runtime_paths(project_dir=None, config_path=None, model_path=None):
+    """Resolve explicit paths before loading any project configuration."""
+    project_dir = os.path.abspath(project_dir) if project_dir else None
+    if config_path:
+        config_path = os.path.abspath(config_path)
+    elif project_dir:
+        config_path = os.path.join(project_dir, 'BehaveAI_settings.ini')
+    else:
+        config_path = os.path.abspath('BehaveAI_settings.ini')
 
-# Read parameters
-try:
-    
-    primary_motion_classes = [name.strip() for name in config['DEFAULT']['primary_motion_classes'].split(',')]
-    cols = [c.strip() for c in config['DEFAULT'].get('primary_motion_colors', '').split(';') if c.strip()]
-    primary_motion_colors = [tuple(map(int, c.split(',')))[::-1] for c in cols]
-    primary_motion_hotkeys = [key.strip() for key in config['DEFAULT']['primary_motion_hotkeys'].split(',')]
-    
-    secondary_motion_classes = [name.strip() for name in config['DEFAULT']['secondary_motion_classes'].split(',')]
-    cols = [c.strip() for c in config['DEFAULT'].get('secondary_motion_colors', '').split(';') if c.strip()]
-    secondary_motion_colors = [tuple(map(int, c.split(',')))[::-1] for c in cols]
-    secondary_motion_hotkeys = [key.strip() for key in config['DEFAULT']['secondary_motion_hotkeys'].split(',')]
-    
-    primary_static_classes = [name.strip() for name in config['DEFAULT']['primary_static_classes'].split(',')]
-    cols = [c.strip() for c in config['DEFAULT'].get('primary_static_colors', '').split(';') if c.strip()]
-    primary_static_colors = [tuple(map(int, c.split(',')))[::-1] for c in cols]
-    primary_static_hotkeys = [key.strip() for key in config['DEFAULT']['primary_static_hotkeys'].split(',')]
-    
-    secondary_static_classes = [name.strip() for name in config['DEFAULT']['secondary_static_classes'].split(',')]
-    cols = [c.strip() for c in config['DEFAULT'].get('secondary_static_colors', '').split(';') if c.strip()]
-    secondary_static_colors = [tuple(map(int, c.split(',')))[::-1] for c in cols]
-    secondary_static_hotkeys = [key.strip() for key in config['DEFAULT']['secondary_static_hotkeys'].split(',')]
-
-    if len(secondary_motion_classes) >= 2 or len(secondary_static_classes) >= 2:
-        hierarchical_mode = True
-        motion_cropped_base_dir = 'annot_motion_crop'
-        static_cropped_base_dir = 'annot_static_crop'
-        
-        # secondary classes need more than one value, so clear if there's only one value
-        if len(secondary_motion_classes) == 1:
-            secondary_motion_classes = []
-            secondary_motion_colors = []
-            secondary_motion_hotkeys = []
-                    
-        if len(secondary_static_classes) == 1:
-            secondary_static_classes = []
-            secondary_static_colors = []
-            secondary_static_hotkeys = []
-
-    else: hierarchical_mode = False
+    if model_path:
+        model_path = os.path.abspath(model_path)
+    elif project_dir:
+        model_path = os.path.join(
+            project_dir, 'model_primary_static', 'train', 'weights', 'best.pt'
+        )
+    return config_path, model_path
 
 
-    primary_classes = primary_static_classes + primary_motion_classes
-    primary_colors = primary_static_colors + primary_motion_colors
-    primary_hotkeys = primary_static_hotkeys + primary_motion_hotkeys
-    
-    secondary_classes = secondary_static_classes + secondary_motion_classes
-    secondary_colors = secondary_static_colors + secondary_motion_colors
-    secondary_hotkeys = secondary_static_hotkeys + secondary_motion_hotkeys
+def load_configuration(config_path='BehaveAI_settings.ini', model_override=None):
+    """Load tracker settings only after command-line parsing has succeeded."""
+    global config, project_base_dir
+    global primary_motion_classes, primary_motion_colors, primary_motion_hotkeys
+    global secondary_motion_classes, secondary_motion_colors, secondary_motion_hotkeys
+    global primary_static_classes, primary_static_colors, primary_static_hotkeys
+    global secondary_static_classes, secondary_static_colors, secondary_static_hotkeys
+    global hierarchical_mode, motion_cropped_base_dir, static_cropped_base_dir
+    global primary_classes, primary_colors, primary_hotkeys
+    global secondary_classes, secondary_colors, secondary_hotkeys, secondary_class_ids
+    global primary_static_project_path, primary_static_model_path, primary_static_yaml_path
+    global primary_motion_project_path, primary_motion_model_path, primary_motion_yaml_path
+    global secondary_static_project_path, secondary_static_data_path, secondary_static_model_path
+    global secondary_motion_project_path, secondary_motion_data_path, secondary_motion_model_path
+    global ignore_secondary, dominant_source
+    global primary_classifier, primary_epochs, secondary_classifier, secondary_epochs
+    global scale_factor, expA, expB, expA2, expB2, lum_weight, strategy
+    global chromatic_tail_only, rgb_multipliers, use_ncnn, oriented
+    global primary_conf_thresh, secondary_conf_thresh, match_distance_thresh
+    global delete_after_missed, centroid_merge_thresh, iou_thresh
+    global line_thickness, font_size, frame_skip
+    global process_noise_pos, process_noise_vel, measurement_noise, motion_threshold
 
-    primary_static_project_path = 'model_primary_static'
-    primary_static_model_path = os.path.join('model_primary_static', "train", "weights", "best.pt")
-    primary_static_yaml_path = 'static_annotations.yaml'
-    
-    primary_motion_project_path = 'model_primary_motion'
-    primary_motion_model_path = os.path.join('model_primary_motion', "train", "weights", "best.pt")
-    primary_motion_yaml_path = 'motion_annotations.yaml'
-    
-    ignore_secondary = [name.strip() for name in config['DEFAULT']['ignore_secondary'].split(',')]
-    dominant_source = config['DEFAULT']['dominant_source'].lower()
+    config_path = os.path.abspath(config_path)
+    project_base_dir = os.path.dirname(config_path)
+    config = configparser.ConfigParser()
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+    config.read(config_path)
 
-    primary_classifier = config['DEFAULT'].get('primary_classifier', 'yolo11s.pt') 
-    primary_epochs = int(config['DEFAULT'].get('primary_epochs', '50'))
-    secondary_classifier = config['DEFAULT'].get('secondary_classifier', 'yolo11s-cls.pt')  
-    secondary_epochs = int(config['DEFAULT'].get('secondary_epochs', '50'))
+    try:
+        primary_motion_classes = [name.strip() for name in config['DEFAULT']['primary_motion_classes'].split(',')]
+        cols = [c.strip() for c in config['DEFAULT'].get('primary_motion_colors', '').split(';') if c.strip()]
+        primary_motion_colors = [tuple(map(int, c.split(',')))[::-1] for c in cols]
+        primary_motion_hotkeys = [key.strip() for key in config['DEFAULT']['primary_motion_hotkeys'].split(',')]
 
-    if hierarchical_mode:
-        secondary_static_project_path = 'model_secondary_static'
-        secondary_static_data_path = 'annot_static_crop'
-        secondary_static_model_path = os.path.join('model_secondary_static', "train", "weights", "best.pt")
-        
-        secondary_motion_project_path = 'model_secondary_motion'
-        secondary_motion_data_path = 'annot_motion_crop'
-        secondary_motion_model_path = os.path.join('model_secondary_motion', "train", "weights", "best.pt")
-        
-        secondary_class_ids = list(range(len(secondary_classes)))
-        paired = list(zip(secondary_classes, secondary_colors, secondary_class_ids, secondary_hotkeys))
-        paired_sorted = sorted(paired, key=lambda x: x[0].lower())
-        secondary_classes, secondary_colors, secondary_class_ids, secondary_hotkeys = zip(*paired_sorted)
-        # Convert back to lists
-        secondary_classes = list(secondary_classes)
-        secondary_colors = list(secondary_colors)   
-        secondary_class_ids = list(secondary_class_ids)
-        secondary_hotkeys = list(secondary_hotkeys)
-    
-    # Common parameters
-    scale_factor = float(config['DEFAULT'].get('scale_factor', '1.0'))
-    expA = float(config['DEFAULT'].get('expA', '0.5'))
-    expB = float(config['DEFAULT'].get('expB', '0.8'))
-    lum_weight = float(config['DEFAULT'].get('lum_weight', '0.7'))
-    strategy = config['DEFAULT'].get('strategy', 'exponential')
-    chromatic_tail_only = config['DEFAULT']['chromatic_tail_only'].lower()
-    rgb_multipliers = [float(x) for x in config['DEFAULT']['rgb_multipliers'].split(',')]
-    use_ncnn = config['DEFAULT']['use_ncnn'].lower()
-    primary_conf_thresh = float(config['DEFAULT'].get('primary_conf_thresh', '0.5'))
-    secondary_conf_thresh = float(config['DEFAULT'].get('secondary_conf_thresh', '0.5'))
-    match_distance_thresh = float(config['DEFAULT'].get('match_distance_thresh', '200'))
-    delete_after_missed = float(config['DEFAULT'].get('delete_after_missed', '5'))
-    centroid_merge_thresh = float(config['DEFAULT'].get('centroid_merge_thresh', '50'))
-    iou_thresh = float(config['DEFAULT'].get('iou_thresh', '0.95'))
-    line_thickness = int(config['DEFAULT'].get('line_thickness', '1'))
-    font_size = float(config['DEFAULT'].get('font_size', '0.5'))
-    frame_skip = int(config['DEFAULT'].get('frame_skip', '0'))
+        secondary_motion_classes = [name.strip() for name in config['DEFAULT']['secondary_motion_classes'].split(',')]
+        cols = [c.strip() for c in config['DEFAULT'].get('secondary_motion_colors', '').split(';') if c.strip()]
+        secondary_motion_colors = [tuple(map(int, c.split(',')))[::-1] for c in cols]
+        secondary_motion_hotkeys = [key.strip() for key in config['DEFAULT']['secondary_motion_hotkeys'].split(',')]
 
-    process_noise_pos = float(config['kalman'].get('process_noise_pos', '0.01'))
-    process_noise_vel = float(config['kalman'].get('process_noise_vel', '0.1'))
-    measurement_noise = float(config['kalman'].get('measurement_noise', '0.1'))
-    motion_threshold = -1 * int(config['DEFAULT'].get('motion_threshold', '0'))
+        primary_static_classes = [name.strip() for name in config['DEFAULT']['primary_static_classes'].split(',')]
+        cols = [c.strip() for c in config['DEFAULT'].get('primary_static_colors', '').split(';') if c.strip()]
+        primary_static_colors = [tuple(map(int, c.split(',')))[::-1] for c in cols]
+        primary_static_hotkeys = [key.strip() for key in config['DEFAULT']['primary_static_hotkeys'].split(',')]
 
-except KeyError as e:
-    raise KeyError(f"Missing configuration parameter: {e}")
+        secondary_static_classes = [name.strip() for name in config['DEFAULT']['secondary_static_classes'].split(',')]
+        cols = [c.strip() for c in config['DEFAULT'].get('secondary_static_colors', '').split(';') if c.strip()]
+        secondary_static_colors = [tuple(map(int, c.split(',')))[::-1] for c in cols]
+        secondary_static_hotkeys = [key.strip() for key in config['DEFAULT']['secondary_static_hotkeys'].split(',')]
 
+        if len(secondary_motion_classes) >= 2 or len(secondary_static_classes) >= 2:
+            hierarchical_mode = True
+            motion_cropped_base_dir = 'annot_motion_crop'
+            static_cropped_base_dir = 'annot_static_crop'
 
-# Validate configuration
+            if len(secondary_motion_classes) == 1:
+                secondary_motion_classes = []
+                secondary_motion_colors = []
+                secondary_motion_hotkeys = []
 
-if len(primary_motion_classes) != len(primary_motion_colors) or len(primary_motion_classes) != len(primary_motion_hotkeys):
-    raise ValueError("Primary motion classes, colors and hotkeys must match in configuration.")
-if len(secondary_motion_classes) != len(secondary_motion_colors) or len(secondary_motion_classes) != len(secondary_motion_hotkeys):
-    raise ValueError("Secondary motion classes, colors and hotkeys must match in configuration.")
-if len(primary_static_classes) != len(primary_static_colors) or len(primary_static_classes) != len(primary_static_hotkeys):
-    raise ValueError("Primary static classes, colors and hotkeys must match in configuration.")
-if len(secondary_static_classes) != len(secondary_static_colors) or len(secondary_static_classes) != len(secondary_static_hotkeys):
-    raise ValueError("Secondary static classes, colors and hotkeys must match in configuration.")
-if dominant_source != 'motion' and dominant_source != 'static' and dominant_source != 'confidence':
-    raise ValueError("dominant_source must be motion, static, or confidence")
+            if len(secondary_static_classes) == 1:
+                secondary_static_classes = []
+                secondary_static_colors = []
+                secondary_static_hotkeys = []
+        else:
+            hierarchical_mode = False
+
+        primary_classes = primary_static_classes + primary_motion_classes
+        primary_colors = primary_static_colors + primary_motion_colors
+        primary_hotkeys = primary_static_hotkeys + primary_motion_hotkeys
+        secondary_classes = secondary_static_classes + secondary_motion_classes
+        secondary_colors = secondary_static_colors + secondary_motion_colors
+        secondary_hotkeys = secondary_static_hotkeys + secondary_motion_hotkeys
+
+        primary_static_project_path = os.path.join(project_base_dir, 'model_primary_static')
+        primary_static_model_path = os.path.join(primary_static_project_path, "train", "weights", "best.pt")
+        primary_static_yaml_path = os.path.join(project_base_dir, 'static_annotations.yaml')
+        primary_motion_project_path = os.path.join(project_base_dir, 'model_primary_motion')
+        primary_motion_model_path = os.path.join(primary_motion_project_path, "train", "weights", "best.pt")
+        primary_motion_yaml_path = os.path.join(project_base_dir, 'motion_annotations.yaml')
+
+        ignore_secondary = [name.strip() for name in config['DEFAULT']['ignore_secondary'].split(',')]
+        dominant_source = config['DEFAULT']['dominant_source'].lower()
+        primary_classifier = config['DEFAULT'].get('primary_classifier', 'yolo11s.pt')
+        primary_epochs = int(config['DEFAULT'].get('primary_epochs', '50'))
+        secondary_classifier = config['DEFAULT'].get('secondary_classifier', 'yolo11s-cls.pt')
+        secondary_epochs = int(config['DEFAULT'].get('secondary_epochs', '50'))
+
+        if hierarchical_mode:
+            secondary_static_project_path = os.path.join(project_base_dir, 'model_secondary_static')
+            secondary_static_data_path = os.path.join(project_base_dir, 'annot_static_crop')
+            secondary_static_model_path = os.path.join(secondary_static_project_path, "train", "weights", "best.pt")
+            secondary_motion_project_path = os.path.join(project_base_dir, 'model_secondary_motion')
+            secondary_motion_data_path = os.path.join(project_base_dir, 'annot_motion_crop')
+            secondary_motion_model_path = os.path.join(secondary_motion_project_path, "train", "weights", "best.pt")
+
+            secondary_class_ids = list(range(len(secondary_classes)))
+            paired = list(zip(secondary_classes, secondary_colors, secondary_class_ids, secondary_hotkeys))
+            paired_sorted = sorted(paired, key=lambda x: x[0].lower())
+            secondary_classes, secondary_colors, secondary_class_ids, secondary_hotkeys = zip(*paired_sorted)
+            secondary_classes = list(secondary_classes)
+            secondary_colors = list(secondary_colors)
+            secondary_class_ids = list(secondary_class_ids)
+            secondary_hotkeys = list(secondary_hotkeys)
+
+        scale_factor = float(config['DEFAULT'].get('scale_factor', '1.0'))
+        expA = float(config['DEFAULT'].get('expA', '0.5'))
+        expB = float(config['DEFAULT'].get('expB', '0.8'))
+        expA2 = 1 - expA
+        expB2 = 1 - expB
+        lum_weight = float(config['DEFAULT'].get('lum_weight', '0.7'))
+        strategy = config['DEFAULT'].get('strategy', 'exponential')
+        chromatic_tail_only = config['DEFAULT']['chromatic_tail_only'].lower()
+        rgb_multipliers = [float(x) for x in config['DEFAULT']['rgb_multipliers'].split(',')]
+        use_ncnn = config['DEFAULT']['use_ncnn'].lower()
+        oriented = config['DEFAULT'].get('box_shape', 'boxes').lower() == 'oriented'
+        primary_conf_thresh = float(config['DEFAULT'].get('primary_conf_thresh', '0.5'))
+        secondary_conf_thresh = float(config['DEFAULT'].get('secondary_conf_thresh', '0.5'))
+        match_distance_thresh = float(config['DEFAULT'].get('match_distance_thresh', '200'))
+        delete_after_missed = float(config['DEFAULT'].get('delete_after_missed', '5'))
+        centroid_merge_thresh = float(config['DEFAULT'].get('centroid_merge_thresh', '50'))
+        iou_thresh = float(config['DEFAULT'].get('iou_thresh', '0.95'))
+        line_thickness = int(config['DEFAULT'].get('line_thickness', '1'))
+        font_size = float(config['DEFAULT'].get('font_size', '0.5'))
+        frame_skip = int(config['DEFAULT'].get('frame_skip', '0'))
+
+        process_noise_pos = float(config['kalman'].get('process_noise_pos', '0.01'))
+        process_noise_vel = float(config['kalman'].get('process_noise_vel', '0.1'))
+        measurement_noise = float(config['kalman'].get('measurement_noise', '0.1'))
+        motion_threshold = -1 * int(config['DEFAULT'].get('motion_threshold', '0'))
+    except KeyError as exc:
+        raise KeyError(f"Missing configuration parameter: {exc}") from exc
+
+    if len(primary_motion_classes) != len(primary_motion_colors) or len(primary_motion_classes) != len(primary_motion_hotkeys):
+        raise ValueError("Primary motion classes, colors and hotkeys must match in configuration.")
+    if len(secondary_motion_classes) != len(secondary_motion_colors) or len(secondary_motion_classes) != len(secondary_motion_hotkeys):
+        raise ValueError("Secondary motion classes, colors and hotkeys must match in configuration.")
+    if len(primary_static_classes) != len(primary_static_colors) or len(primary_static_classes) != len(primary_static_hotkeys):
+        raise ValueError("Primary static classes, colors and hotkeys must match in configuration.")
+    if len(secondary_static_classes) != len(secondary_static_colors) or len(secondary_static_classes) != len(secondary_static_hotkeys):
+        raise ValueError("Secondary static classes, colors and hotkeys must match in configuration.")
+    if dominant_source not in {'motion', 'static', 'confidence'}:
+        raise ValueError("dominant_source must be motion, static, or confidence")
+
+    if model_override:
+        static_enabled = primary_static_classes[0] != '0'
+        motion_enabled = primary_motion_classes[0] != '0'
+        if static_enabled and motion_enabled:
+            raise ValueError(
+                "--model is ambiguous when both primary static and motion models "
+                "are enabled; use their project-default paths instead."
+            )
+        if not static_enabled and not motion_enabled:
+            raise ValueError("--model was provided, but no primary model is enabled.")
+        if static_enabled:
+            primary_static_model_path = model_override
+        else:
+            primary_motion_model_path = model_override
 
 # This command-line tracker is inference-only. Annotation datasets and settings
 # snapshots are not required when trained weights already exist.
@@ -302,91 +360,102 @@ def maybe_retrain(model_type, yaml_path, project_path, model_path, classifier, e
         )
     return False
 
-# Train secondary classifiers for each static class
 secondary_static_models = None
 secondary_motion_models = None
 
-if hierarchical_mode:
-    secondary_static_models = {}
-    static_class_map = [[None] * len(secondary_classes) for _ in range(len(primary_classes))]
-    if len(secondary_static_classes) >= 2:
-        for primary_class in primary_classes:
-            idx = primary_classes.index(primary_class)
-            hotkey = primary_hotkeys[idx]
-            if hotkey in secondary_hotkeys: 
-                continue
-                
-            if primary_class in ignore_secondary:
-                continue
-            
-            data_dir = os.path.join(secondary_static_data_path, primary_class)
-            # Skip if directory doesn't exist
-            if not os.path.isdir(data_dir):
-                continue
-            
-            # Create model directory for this static class
-            model_dir = f"model_static_static_{primary_class}"
-            weights_path = os.path.join(model_dir, "train", "weights", "best.pt")
-            
-            maybe_retrain(model_dir, data_dir, model_dir, 
-                weights_path, secondary_classifier, secondary_epochs, 224)
 
-            # Load the trained model
-            if use_ncnn == 'true':
-                secondary_static_models[primary_class] = load_model_with_ncnn_preference(weights_path)
-            else:
-                secondary_static_models[primary_class] = YOLO(weights_path)
+def initialize_models():
+    """Validate and load configured models after argument and config parsing."""
+    global secondary_static_models, secondary_motion_models
+    global static_class_map, motion_class_map
 
+    if hierarchical_mode:
+        secondary_static_models = {}
+        static_class_map = [[None] * len(secondary_classes) for _ in range(len(primary_classes))]
+        if len(secondary_static_classes) >= 2:
+            for primary_class in primary_classes:
+                idx = primary_classes.index(primary_class)
+                hotkey = primary_hotkeys[idx]
+                if hotkey in secondary_hotkeys or primary_class in ignore_secondary:
+                    continue
 
-        # ~ print(f"secondary_static_models {secondary_static_models}")
-        
-    secondary_motion_models = {}
-    motion_class_map = [[None] * len(secondary_classes) for _ in range(len(primary_classes))]
-    if len(secondary_motion_classes) >= 2:
-        for primary_class in primary_classes:
-            idx = primary_classes.index(primary_class)
-            hotkey = primary_hotkeys[idx]
-            if hotkey in secondary_hotkeys: 
-                continue
-            
-            if primary_class in ignore_secondary:
-                continue            
-            
-            data_dir = os.path.join(secondary_motion_data_path, primary_class)
-            # Skip if directory doesn't exist
-            if not os.path.isdir(data_dir):
-                continue
-            
-            # Create model directory for this static class
-            model_dir = f"model_secondary_motion_{primary_class}"
-            weights_path = os.path.join(model_dir, "train", "weights", "best.pt")
-            
-            maybe_retrain(model_dir, data_dir, model_dir, 
-                weights_path, secondary_classifier, secondary_epochs, 224)
+                data_dir = os.path.join(secondary_static_data_path, primary_class)
+                if not os.path.isdir(data_dir):
+                    continue
 
-            # Load the trained model
-            if use_ncnn == 'true':
-                secondary_motion_models[primary_class] = load_model_with_ncnn_preference(weights_path)
-            else:
-                secondary_motion_models[primary_class] = YOLO(weights_path)
-                
-        # ~ print(f"secondary_motion_models {secondary_motion_models}")
+                model_dir = os.path.join(
+                    project_base_dir, f"model_static_static_{primary_class}"
+                )
+                weights_path = os.path.join(model_dir, "train", "weights", "best.pt")
+                maybe_retrain(
+                    model_dir,
+                    data_dir,
+                    model_dir,
+                    weights_path,
+                    secondary_classifier,
+                    secondary_epochs,
+                    224,
+                )
+                if use_ncnn == 'true':
+                    secondary_static_models[primary_class] = load_model_with_ncnn_preference(weights_path)
+                else:
+                    secondary_static_models[primary_class] = YOLO(weights_path)
 
-#-------CHECK PRIMARY MODEL EXISTS----------
-if primary_static_classes[0] != '0':
-    maybe_retrain('primary static', primary_static_yaml_path, primary_static_project_path, 
-        primary_static_model_path, primary_classifier, primary_epochs, 640)
+        secondary_motion_models = {}
+        motion_class_map = [[None] * len(secondary_classes) for _ in range(len(primary_classes))]
+        if len(secondary_motion_classes) >= 2:
+            for primary_class in primary_classes:
+                idx = primary_classes.index(primary_class)
+                hotkey = primary_hotkeys[idx]
+                if hotkey in secondary_hotkeys or primary_class in ignore_secondary:
+                    continue
 
+                data_dir = os.path.join(secondary_motion_data_path, primary_class)
+                if not os.path.isdir(data_dir):
+                    continue
 
-if primary_motion_classes[0] != '0':
-    maybe_retrain('primary motion', primary_motion_yaml_path, primary_motion_project_path, 
-        primary_motion_model_path, primary_classifier, primary_epochs, 640)
+                model_dir = os.path.join(
+                    project_base_dir, f"model_secondary_motion_{primary_class}"
+                )
+                weights_path = os.path.join(model_dir, "train", "weights", "best.pt")
+                maybe_retrain(
+                    model_dir,
+                    data_dir,
+                    model_dir,
+                    weights_path,
+                    secondary_classifier,
+                    secondary_epochs,
+                    224,
+                )
+                if use_ncnn == 'true':
+                    secondary_motion_models[primary_class] = load_model_with_ncnn_preference(weights_path)
+                else:
+                    secondary_motion_models[primary_class] = YOLO(weights_path)
+
+    if primary_static_classes[0] != '0':
+        maybe_retrain(
+            'primary static',
+            primary_static_yaml_path,
+            primary_static_project_path,
+            primary_static_model_path,
+            primary_classifier,
+            primary_epochs,
+            640,
+        )
+
+    if primary_motion_classes[0] != '0':
+        maybe_retrain(
+            'primary motion',
+            primary_motion_yaml_path,
+            primary_motion_project_path,
+            primary_motion_model_path,
+            primary_classifier,
+            primary_epochs,
+            640,
+        )
 
 
 # --- PARAMETERS -----------------------------------------------------------
-
-expA2 = 1 - expA
-expB2 = 1 - expB
 
 input_folder = "./input/"
 output_folder = "./output/"
@@ -596,6 +665,48 @@ def bbox_in_source_coordinates(coords, processed_size, source_size):
     )
 
 
+def oriented_box_in_source_coordinates(xywhr, processed_size, source_size):
+    """Map an oriented ``(cx, cy, width, height, radians)`` box to source pixels."""
+    cx, cy, box_width, box_height, angle = xywhr
+    processed_width, processed_height = processed_size
+    source_width, source_height = source_size
+    x_scale = source_width / processed_width
+    y_scale = source_height / processed_height
+    return (
+        cx * x_scale,
+        cy * y_scale,
+        box_width * x_scale,
+        box_height * y_scale,
+        angle,
+    )
+
+
+def iter_primary_detections(result, class_names):
+    """Yield enclosing rectangles from standard or oriented YOLO results."""
+    boxes = result.obb if oriented and result.obb is not None else result.boxes
+    # Be tolerant of an OBB model paired with an older config that omitted
+    # box_shape=oriented. Ultralytics leaves result.boxes as None in that case.
+    if boxes is None and result.obb is not None:
+        boxes = result.obb
+    if boxes is None:
+        return
+    using_oriented_boxes = result.obb is not None and boxes is result.obb
+    for box in boxes:
+        class_idx = int(box.cls[0])
+        prediction = {
+            'coords': tuple(map(int, box.xyxy[0].tolist())),
+            'primary_class': class_names[class_idx],
+            'primary_conf': float(box.conf[0]),
+        }
+        if using_oriented_boxes:
+            prediction['oriented_bbox'] = tuple(
+                float(value) for value in box.xywhr[0].tolist()
+            )
+        else:
+            prediction['oriented_bbox'] = None
+        yield prediction
+
+
 def process_video(file, viz=False, export_crop_manifest=False):
     """Track a video and optionally export source-referenced crop metadata."""
     os.makedirs(output_folder, exist_ok=True)
@@ -650,6 +761,7 @@ def process_video(file, viz=False, export_crop_manifest=False):
         crop_manifest_writer = csv.writer(crop_manifest_file)
         crop_manifest_writer.writerow([
             "source_video", "frame", "track_id", "x1", "y1", "x2", "y2",
+            "obb_cx", "obb_cy", "obb_width", "obb_height", "obb_angle_radians",
             "detection_source",
             "primary_static_class", "primary_static_conf",
             "primary_motion_class", "primary_motion_conf",
@@ -714,15 +826,11 @@ def process_video(file, viz=False, export_crop_manifest=False):
             # Primary static detection
             if primary_static_classes[0] != '0':
                 results_static = model_static.predict(frame, conf=primary_conf_thresh, verbose=False)
-                for box in results_static[0].boxes:
-                    coords = tuple(map(int, box.xyxy[0].tolist()))
-                    class_idx = int(box.cls[0])
-                    class_name = primary_static_classes[class_idx]
-                    conf = float(box.conf[0])
+                for prediction in iter_primary_detections(
+                    results_static[0], primary_static_classes
+                ):
                     all_detections.append({
-                        'coords': coords,
-                        'primary_class': class_name,
-                        'primary_conf': conf,
+                        **prediction,
                         'source': 'static',
                         'primary_class_combined': '',
                         'primary_conf_combined': 0.0
@@ -731,15 +839,11 @@ def process_video(file, viz=False, export_crop_manifest=False):
             # Primary motion detection
             if primary_motion_classes[0] != '0':
                 results_motion = model_motion.predict(motion_image, conf=primary_conf_thresh, verbose=False)
-                for box in results_motion[0].boxes:
-                    coords = tuple(map(int, box.xyxy[0].tolist()))
-                    class_idx = int(box.cls[0])
-                    class_name = primary_motion_classes[class_idx]
-                    conf = float(box.conf[0])
+                for prediction in iter_primary_detections(
+                    results_motion[0], primary_motion_classes
+                ):
                     all_detections.append({
-                        'coords': coords,
-                        'primary_class': class_name,
-                        'primary_conf': conf,
+                        **prediction,
                         'source': 'motion',
                         'primary_class_combined': '',
                         'primary_conf_combined': 0.0
@@ -774,6 +878,7 @@ def process_video(file, viz=False, export_crop_manifest=False):
                                     md['primary_class'] = det['primary_class']
                                     md['primary_conf'] = det['primary_conf']
                                     md['coords'] = det['coords']  # Update to higher conf box
+                                    md['oriented_bbox'] = det.get('oriented_bbox')
                                     md['centroid'] = (cx, cy)
                                     md['source'] = det['source']
                             else:  # motion source
@@ -784,6 +889,7 @@ def process_video(file, viz=False, export_crop_manifest=False):
                                     md['primary_class'] = det['primary_class']
                                     md['primary_conf'] = det['primary_conf']
                                     md['coords'] = det['coords']  # Update to higher conf box
+                                    md['oriented_bbox'] = det.get('oriented_bbox')
                                     md['centroid'] = (cx, cy)
                                     md['source'] = det['source']
                         elif det['source'] == 'static' and dominant_source == 'static':
@@ -793,6 +899,7 @@ def process_video(file, viz=False, export_crop_manifest=False):
                                 md['primary_class'] = det['primary_class']
                                 md['primary_conf'] = det['primary_conf']
                                 md['coords'] = det['coords']  # Update to higher conf box
+                                md['oriented_bbox'] = det.get('oriented_bbox')
                                 md['centroid'] = (cx, cy)
                                 md['source'] = det['source']
                         elif det['source'] == 'motion' and dominant_source == 'motion':
@@ -802,6 +909,7 @@ def process_video(file, viz=False, export_crop_manifest=False):
                                 md['primary_class'] = det['primary_class']
                                 md['primary_conf'] = det['primary_conf']
                                 md['coords'] = det['coords']  # Update to higher conf box
+                                md['oriented_bbox'] = det.get('oriented_bbox')
                                 md['centroid'] = (cx, cy)
                                 md['source'] = det['source']
     
@@ -815,6 +923,7 @@ def process_video(file, viz=False, export_crop_manifest=False):
                         'coords': det['coords'],
                         'centroid': (cx, cy),
                         'source': det['source'],
+                        'oriented_bbox': det.get('oriented_bbox'),
                         'primary_class_combined': '',
                         'primary_conf_combined': 0.0
                     }
@@ -1025,8 +1134,18 @@ def process_video(file, viz=False, export_crop_manifest=False):
                         (frame.shape[1], frame.shape[0]),
                         (source_width, source_height),
                     )
+                    oriented_bbox = det.get('oriented_bbox')
+                    if oriented_bbox is not None:
+                        source_oriented_bbox = oriented_box_in_source_coordinates(
+                            oriented_bbox,
+                            (frame.shape[1], frame.shape[0]),
+                            (source_width, source_height),
+                        )
+                    else:
+                        source_oriented_bbox = ('', '', '', '', '')
                     crop_manifest_writer.writerow([
-                        os.path.abspath(file), frame_idx, tid, *source_bbox, p_source,
+                        os.path.abspath(file), frame_idx, tid, *source_bbox,
+                        *source_oriented_bbox, p_source,
                         ps_class, f"{ps_conf:.3f}",
                         pm_class, f"{pm_conf:.3f}",
                         ss_class, f"{ss_conf:.3f}",
@@ -1070,12 +1189,26 @@ def process_video(file, viz=False, export_crop_manifest=False):
     print(f"Done processing {base} | {current_fps:.1f} FPS")
 
 ### Added by Ammon 
-import argparse
 def build_parse():
     parser = argparse.ArgumentParser(description='Required and additional inputs') 
     parser.add_argument('--in_file','-i',required=True,help='Path to input .mp4')
     parser.add_argument('--out_folder','-o',required=False,default='./output/',help='Path to output .csv, if blank, defaults to output directory')
     parser.add_argument('--make_vid','-v',required=False,action='store_true',help='option to create output video')
+    parser.add_argument(
+        '--project-dir',
+        help=(
+            'project directory containing BehaveAI_settings.ini and the default '
+            'model_primary_static/train/weights/best.pt model'
+        ),
+    )
+    parser.add_argument(
+        '--config',
+        help='settings INI path; overrides the config inferred from --project-dir',
+    )
+    parser.add_argument(
+        '--model',
+        help='primary model path; overrides the model inferred from --project-dir',
+    )
     parser.add_argument(
         '--export-crop-manifest', '--export_crop_manifest',
         dest='export_crop_manifest',
@@ -1089,6 +1222,14 @@ def build_parse():
 
 if __name__ == '__main__':
     args = build_parse()
+    load_runtime_dependencies()
+    config_path, model_path = resolve_runtime_paths(
+        project_dir=args.project_dir,
+        config_path=args.config,
+        model_path=args.model,
+    )
+    load_configuration(config_path, model_override=model_path)
+    initialize_models()
     vid = args.in_file
     if output_folder is not None:
         output_folder = args.out_folder

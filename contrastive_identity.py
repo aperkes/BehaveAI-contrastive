@@ -80,6 +80,7 @@ class Detection:
     track_id: str
     bbox: tuple
     manifest_index: int
+    oriented_bbox: tuple | None = None
 
     @property
     def track_key(self):
@@ -172,12 +173,31 @@ def read_manifests(manifest_paths, video_overrides=None):
             for row in reader:
                 video = override or os.path.abspath(row["source_video"])
                 bbox = tuple(int(float(row[name])) for name in ("x1", "y1", "x2", "y2"))
+                oriented_fields = (
+                    "obb_cx",
+                    "obb_cy",
+                    "obb_width",
+                    "obb_height",
+                    "obb_angle_radians",
+                )
+                oriented_values = [row.get(name, "").strip() for name in oriented_fields]
+                if any(oriented_values) and not all(oriented_values):
+                    raise ValueError(
+                        f"{manifest_path} row {reader.line_num} has incomplete "
+                        "oriented-box coordinates."
+                    )
+                oriented_bbox = (
+                    tuple(float(value) for value in oriented_values)
+                    if all(oriented_values)
+                    else None
+                )
                 detection = Detection(
                     video=video,
                     frame=int(row["frame"]),
                     track_id=str(row["track_id"]),
                     bbox=bbox,
                     manifest_index=len(raw_rows),
+                    oriented_bbox=oriented_bbox,
                 )
                 detections.append(detection)
                 copied_row = dict(row)
@@ -610,6 +630,32 @@ def mask_to_moving_foreground(image, background, threshold, morph_kernel):
     return np.where(labels[..., None] == largest, image, 0).astype(np.uint8)
 
 
+def extract_oriented_crop(image, oriented_bbox):
+    """Rotate an OBB into a tight crop, with its long axis horizontal."""
+    cx, cy, box_width, box_height, angle_radians = oriented_bbox
+    if box_width <= 0 or box_height <= 0:
+        raise ValueError(f"Invalid oriented crop dimensions: {oriented_bbox}")
+    rotation = cv2.getRotationMatrix2D(
+        (float(cx), float(cy)), np.degrees(angle_radians), 1.0
+    )
+    rotated = cv2.warpAffine(
+        image,
+        rotation,
+        (image.shape[1], image.shape[0]),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    crop = cv2.getRectSubPix(
+        rotated,
+        (max(1, int(round(box_width))), max(1, int(round(box_height)))),
+        (float(cx), float(cy)),
+    )
+    if crop.shape[0] > crop.shape[1]:
+        crop = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
+    return crop
+
+
 def prepare_detection_crop(
     frame,
     item,
@@ -620,25 +666,35 @@ def prepare_detection_crop(
     input_channels=3,
 ):
     """Extract, optionally mask, and resize one detection crop."""
-    x1, y1, x2, y2 = item.bbox
-    height, width = frame.shape[:2]
-    x1, x2 = sorted((max(0, min(width, x1)), max(0, min(width, x2))))
-    y1, y2 = sorted((max(0, min(height, y1)), max(0, min(height, y2))))
-    if x2 <= x1 or y2 <= y1:
-        raise ValueError(
-            f"Invalid crop at frame {item.frame}, track {item.track_id}: {item.bbox}"
-        )
-
-    crop = frame[y1:y2, x1:x2]
     if background is not None:
         if background.shape != frame.shape:
             raise ValueError(
                 f"Background shape {background.shape} does not match frame shape "
                 f"{frame.shape} for {item.video}"
             )
+    if item.oriented_bbox is not None:
+        crop = extract_oriented_crop(frame, item.oriented_bbox)
+        background_crop = (
+            extract_oriented_crop(background, item.oriented_bbox)
+            if background is not None
+            else None
+        )
+    else:
+        x1, y1, x2, y2 = item.bbox
+        height, width = frame.shape[:2]
+        x1, x2 = sorted((max(0, min(width, x1)), max(0, min(width, x2))))
+        y1, y2 = sorted((max(0, min(height, y1)), max(0, min(height, y2))))
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError(
+                f"Invalid crop at frame {item.frame}, track {item.track_id}: {item.bbox}"
+            )
+        crop = frame[y1:y2, x1:x2]
+        background_crop = background[y1:y2, x1:x2] if background is not None else None
+
+    if background_crop is not None:
         crop = mask_to_moving_foreground(
             crop,
-            background[y1:y2, x1:x2],
+            background_crop,
             background_threshold,
             background_morph_kernel,
         )
@@ -1745,6 +1801,13 @@ def export_crop_samples(
                     "y1": item.bbox[1],
                     "x2": item.bbox[2],
                     "y2": item.bbox[3],
+                    "obb_cx": item.oriented_bbox[0] if item.oriented_bbox else "",
+                    "obb_cy": item.oriented_bbox[1] if item.oriented_bbox else "",
+                    "obb_width": item.oriented_bbox[2] if item.oriented_bbox else "",
+                    "obb_height": item.oriented_bbox[3] if item.oriented_bbox else "",
+                    "obb_angle_radians": (
+                        item.oriented_bbox[4] if item.oriented_bbox else ""
+                    ),
                 }
             )
     finally:
@@ -2425,7 +2488,10 @@ def write_latents(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     coordinate_names = [f"latent_{index:03d}" for index in range(embeddings.shape[1])]
-    fields = ["source_video", "frame", "track_id", "x1", "y1", "x2", "y2"]
+    fields = [
+        "source_video", "frame", "track_id", "x1", "y1", "x2", "y2",
+        "obb_cx", "obb_cy", "obb_width", "obb_height", "obb_angle_radians",
+    ]
     if identity_by_track is not None or identity_by_detection is not None:
         fields.append("predicted_identity")
     if projection is not None:
@@ -2439,6 +2505,7 @@ def write_latents(
         writer.writerow(fields)
         for index, (vector, item) in enumerate(zip(embeddings, detections)):
             row = [item.video, item.frame, item.track_id, *item.bbox]
+            row.extend(item.oriented_bbox or ("", "", "", "", ""))
             if identity_by_detection is not None:
                 row.append(int(identity_by_detection[index]))
             elif identity_by_track is not None:
