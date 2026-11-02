@@ -3,7 +3,6 @@ import numpy as np
 import csv
 import os
 import glob
-from scipy.optimize import linear_sum_assignment
 import configparser
 import time
 import shutil
@@ -13,6 +12,9 @@ import subprocess
 import time
 import sys
 import argparse
+import box_geometry as bg
+from kalman_tracker import KalmanTracker
+from motion_processor import MotionProcessor
 
 
 YOLO = None
@@ -45,7 +47,7 @@ def ncnn_files_exist(ncnn_dir):
     has_bin = any(f.endswith(".bin") for f in os.listdir(ncnn_dir))
     return has_param and has_bin
 
-def ensure_ncnn_export(weights_path, timeout=300):
+def ensure_ncnn_export(weights_path, task="detect", timeout=300):
     """
     Ensure an NCNN conversion exists for weights_path.
     Returns the ncnn_dir on success, None on failure (falls back to .pt).
@@ -57,7 +59,7 @@ def ensure_ncnn_export(weights_path, timeout=300):
 
     try:
         print(f"Exporting {weights_path} -> NCNN (this may take a while)...")
-        model = YOLO(weights_path)
+        model = YOLO(weights_path, task=task)
         # Use Ultralytics export API. This creates the folder "<base>_ncnn_model".
         # Some installs can be slow; we try and catch errors below.
         model.export(format="ncnn")
@@ -76,7 +78,7 @@ def ensure_ncnn_export(weights_path, timeout=300):
         print(f"Warning: NCNN export failed for {weights_path}: {e}")
         return None
 
-def load_model_with_ncnn_preference(weights_path):
+def load_model_with_ncnn_preference(weights_path, task="detect"):
     """
     Attempt to use NCNN if available (or convert it). If conversion or loading fails,
     fall back to the original PyTorch .pt path.
@@ -85,7 +87,7 @@ def load_model_with_ncnn_preference(weights_path):
     # If a .pt was not provided (maybe already a folder), just try loading directly
     if not weights_path.endswith(".pt"):
         try:
-            return YOLO(weights_path)
+            return YOLO(weights_path, task=task)
         except Exception as e:
             print(f"Error loading model {weights_path}: {e}")
             raise
@@ -95,21 +97,21 @@ def load_model_with_ncnn_preference(weights_path):
     if ncnn_files_exist(ncnn_dir):
         try:
             print(f"Loading NCNN model from {ncnn_dir}")
-            return YOLO(ncnn_dir)
+            return YOLO(ncnn_dir, task=task)
         except Exception as e:
             print(f"Failed to load NCNN model at {ncnn_dir}: {e} (falling back to .pt)")
 
     # Otherwise attempt conversion (one-time). If it fails, fall back to .pt.
-    exported = ensure_ncnn_export(weights_path)
+    exported = ensure_ncnn_export(weights_path, task=task)
     if exported:
         try:
-            return YOLO(exported)
+            return YOLO(exported, task=task)
         except Exception as e:
             print(f"Failed to load NCNN-exported model {exported}: {e} (falling back to .pt)")
 
     # Finally, fallback to direct .pt load
     print(f"Using original weights (PyTorch) at {weights_path}")
-    return YOLO(weights_path)
+    return YOLO(weights_path, task=task)
 # --------------------------------------------------------------------
 
 
@@ -150,12 +152,16 @@ def load_configuration(config_path='BehaveAI_settings.ini', model_override=None)
     global secondary_motion_project_path, secondary_motion_data_path, secondary_motion_model_path
     global ignore_secondary, dominant_source
     global primary_classifier, primary_epochs, secondary_classifier, secondary_epochs
-    global scale_factor, expA, expB, expA2, expB2, lum_weight, strategy
+    global scale_factor, expA, expB, lum_weight, strategy
+    global sliding_median_window, sliding_median_signed_color
+    global motion_history_frames, motion_frame_gap
     global chromatic_tail_only, rgb_multipliers, use_ncnn, oriented
-    global primary_conf_thresh, secondary_conf_thresh, match_distance_thresh
-    global delete_after_missed, centroid_merge_thresh, iou_thresh
+    global disambiguate_head_tail, static_ornt_base_dir, motion_ornt_base_dir
+    global primary_conf_thresh, secondary_conf_thresh, match_distance_ratio
+    global delete_after_missed, centroid_merge_ratio, iou_thresh, merge_aware
     global line_thickness, font_size, frame_skip
-    global process_noise_pos, process_noise_vel, measurement_noise, motion_threshold
+    global process_noise_pos_ratio, process_noise_vel_ratio
+    global measurement_noise_ratio, motion_threshold
 
     config_path = os.path.abspath(config_path)
     project_base_dir = os.path.dirname(config_path)
@@ -243,27 +249,39 @@ def load_configuration(config_path='BehaveAI_settings.ini', model_override=None)
         scale_factor = float(config['DEFAULT'].get('scale_factor', '1.0'))
         expA = float(config['DEFAULT'].get('expA', '0.5'))
         expB = float(config['DEFAULT'].get('expB', '0.8'))
-        expA2 = 1 - expA
-        expB2 = 1 - expB
         lum_weight = float(config['DEFAULT'].get('lum_weight', '0.7'))
         strategy = config['DEFAULT'].get('strategy', 'exponential')
+        sliding_median_window = int(config['DEFAULT'].get('sliding_median_window', '50'))
+        sliding_median_signed_color = config['DEFAULT'].get(
+            'sliding_median_signed_color', 'false'
+        ).lower() == 'true'
         chromatic_tail_only = config['DEFAULT']['chromatic_tail_only'].lower()
         rgb_multipliers = [float(x) for x in config['DEFAULT']['rgb_multipliers'].split(',')]
         use_ncnn = config['DEFAULT']['use_ncnn'].lower()
         oriented = config['DEFAULT'].get('box_shape', 'boxes').lower() == 'oriented'
+        disambiguate_head_tail = oriented and config['DEFAULT'].get(
+            'disambiguate_head_tail', 'false'
+        ).lower() == 'true'
+        static_ornt_base_dir = os.path.join(project_base_dir, 'annot_static_ornt')
+        motion_ornt_base_dir = os.path.join(project_base_dir, 'annot_motion_ornt')
         primary_conf_thresh = float(config['DEFAULT'].get('primary_conf_thresh', '0.5'))
         secondary_conf_thresh = float(config['DEFAULT'].get('secondary_conf_thresh', '0.5'))
-        match_distance_thresh = float(config['DEFAULT'].get('match_distance_thresh', '200'))
-        delete_after_missed = float(config['DEFAULT'].get('delete_after_missed', '5'))
-        centroid_merge_thresh = float(config['DEFAULT'].get('centroid_merge_thresh', '50'))
+        match_distance_ratio = float(config['DEFAULT'].get('match_distance_ratio', '2.5'))
+        delete_after_missed = float(config['DEFAULT'].get('delete_after_missed', '15'))
+        centroid_merge_ratio = float(config['DEFAULT'].get('centroid_merge_ratio', '0.7'))
         iou_thresh = float(config['DEFAULT'].get('iou_thresh', '0.95'))
+        merge_aware = config['DEFAULT'].get('merge_aware', 'true').lower() == 'true'
         line_thickness = int(config['DEFAULT'].get('line_thickness', '1'))
         font_size = float(config['DEFAULT'].get('font_size', '0.5'))
         frame_skip = int(config['DEFAULT'].get('frame_skip', '0'))
+        motion_history_frames = int(config['DEFAULT'].get('motion_history_frames', '3'))
+        motion_frame_gap = int(
+            config['DEFAULT'].get('motion_frame_gap', str(frame_skip + 1))
+        )
 
-        process_noise_pos = float(config['kalman'].get('process_noise_pos', '0.01'))
-        process_noise_vel = float(config['kalman'].get('process_noise_vel', '0.1'))
-        measurement_noise = float(config['kalman'].get('measurement_noise', '0.1'))
+        process_noise_pos_ratio = float(config['kalman'].get('process_noise_pos_ratio', '0.05'))
+        process_noise_vel_ratio = float(config['kalman'].get('process_noise_vel_ratio', '0.1'))
+        measurement_noise_ratio = float(config['kalman'].get('measurement_noise_ratio', '0.1'))
         motion_threshold = -1 * int(config['DEFAULT'].get('motion_threshold', '0'))
     except KeyError as exc:
         raise KeyError(f"Missing configuration parameter: {exc}") from exc
@@ -362,11 +380,14 @@ def maybe_retrain(model_type, yaml_path, project_path, model_path, classifier, e
 
 secondary_static_models = None
 secondary_motion_models = None
+ornt_static_models = None
+ornt_motion_models = None
 
 
 def initialize_models():
     """Validate and load configured models after argument and config parsing."""
     global secondary_static_models, secondary_motion_models
+    global ornt_static_models, ornt_motion_models
     global static_class_map, motion_class_map
 
     if hierarchical_mode:
@@ -397,7 +418,9 @@ def initialize_models():
                     224,
                 )
                 if use_ncnn == 'true':
-                    secondary_static_models[primary_class] = load_model_with_ncnn_preference(weights_path)
+                    secondary_static_models[primary_class] = load_model_with_ncnn_preference(
+                        weights_path, "classify"
+                    )
                 else:
                     secondary_static_models[primary_class] = YOLO(weights_path)
 
@@ -428,9 +451,44 @@ def initialize_models():
                     224,
                 )
                 if use_ncnn == 'true':
-                    secondary_motion_models[primary_class] = load_model_with_ncnn_preference(weights_path)
+                    secondary_motion_models[primary_class] = load_model_with_ncnn_preference(
+                        weights_path, "classify"
+                    )
                 else:
                     secondary_motion_models[primary_class] = YOLO(weights_path)
+
+    if disambiguate_head_tail:
+        ornt_static_models = {}
+        ornt_motion_models = {}
+        for primary_class in primary_classes:
+            if primary_static_classes[0] != '0':
+                weights_path = os.path.join(
+                    project_base_dir,
+                    f"model_ornt_static_{primary_class}",
+                    "train",
+                    "weights",
+                    "best.pt",
+                )
+                if os.path.isfile(weights_path):
+                    ornt_static_models[primary_class] = (
+                        load_model_with_ncnn_preference(weights_path, "classify")
+                        if use_ncnn == 'true'
+                        else YOLO(weights_path)
+                    )
+            if primary_motion_classes[0] != '0':
+                weights_path = os.path.join(
+                    project_base_dir,
+                    f"model_ornt_motion_{primary_class}",
+                    "train",
+                    "weights",
+                    "best.pt",
+                )
+                if os.path.isfile(weights_path):
+                    ornt_motion_models[primary_class] = (
+                        load_model_with_ncnn_preference(weights_path, "classify")
+                        if use_ncnn == 'true'
+                        else YOLO(weights_path)
+                    )
 
     if primary_static_classes[0] != '0':
         maybe_retrain(
@@ -455,199 +513,35 @@ def initialize_models():
         )
 
 
+def _orient_conf(model, image):
+    if image is None or image.size == 0:
+        return 0.0
+    result = model.predict(image, verbose=False)[0]
+    if result.probs is None:
+        return 0.0
+    correct_index = next(
+        (index for index, name in model.names.items() if name == 'correct'), None
+    )
+    return 0.0 if correct_index is None else float(result.probs.data[correct_index])
+
+
+def _disambiguate_head_tail(image, head, tail, width, primary_class, is_motion):
+    if not disambiguate_head_tail:
+        return head, tail, width
+    models = ornt_motion_models if is_motion else ornt_static_models
+    model = models.get(primary_class) if models else None
+    if model is None:
+        return head, tail, width
+    return bg.best_head_tail_orientation(
+        image, head, tail, width, lambda crop: _orient_conf(model, crop)
+    )
+
 # --- PARAMETERS -----------------------------------------------------------
 
 input_folder = "./input/"
 output_folder = "./output/"
 
 progress_update = 10 # print progress every n frames
-
-def iou(box1, box2):
-    xa = max(box1[0], box2[0]); ya = max(box1[1], box2[1])
-    xb = min(box1[2], box2[2]); yb = min(box1[3], box2[3])
-    inter = max(0, xb-xa) * max(0, yb-ya)
-    area1 = (box1[2]-box1[0])*(box1[3]-box1[1])
-    area2 = (box2[2]-box2[0])*(box2[3]-box2[1])
-    prop1 = inter/area1 
-    prop2 = inter/area2
-    # return the larger proportional overlap - e.g. if one box is entirely inside another, this will return a 1.0, whereas the previous wouldn't
-    if prop1 > prop2:
-        return prop1 if prop1 > 0 else 0
-    else:
-        return prop2 if prop2 > 0 else 0
-    # ~ union = area1 + area2 - inter
-    # ~ return inter/union if union > 0 else 0
-    
-
-# --- TRACKER CLASS -------------------------------------------------------
-class KalmanTracker:
-    def __init__(self, dist_thresh, max_missed):
-        self.next_id = 1
-        self.tracks = {}  # tid -> {'kf': KalmanFilter, 'missed': int}
-        self.prev_positions = {}  # Track previous positions
-        self.dist_thresh = dist_thresh
-        self.max_missed = max_missed
-
-    def _create_kf(self, initial_pt):
-
-        #Create a 4D state (x, y, vx, vy) Kalman Filter measuring (x, y).
-        kf = cv2.KalmanFilter(4, 2)
-        # State transition: x' = x + vx, y' = y + vy
-        kf.transitionMatrix = np.array([[1, 0, 1, 0],
-                                        [0, 1, 0, 1],
-                                        [0, 0, 1, 0],
-                                        [0, 0, 0, 1]], dtype=np.float32)
-        # Measurement: we only observe x, y
-        kf.measurementMatrix = np.array([[1, 0, 0, 0],
-                                         [0, 1, 0, 0]], dtype=np.float32)
-        # Tune these covariances to your scene
-
-        kf.processNoiseCov = np.diag([process_noise_pos, process_noise_pos, process_noise_vel, process_noise_vel]).astype(np.float32)   
-        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * measurement_noise
-        # Initialize state
-        kf.statePre  = np.array([[initial_pt[0]],
-                                 [initial_pt[1]],
-                                 [0.],
-                                 [0.]], dtype=np.float32)
-        kf.statePost = kf.statePre.copy()
-        return kf
-        
-        self._prune_duplicate_tracks()
-
-    def predict_all(self):
-        """
-        Predict the next position for every track.
-        Returns list of (tid, predicted_pt).
-        """
-        preds = []
-        for tid, tr in self.tracks.items():
-            pred = tr['kf'].predict()
-            preds.append((tid, (float(pred[0, 0]), float(pred[1, 0]))))
-        return preds
-
-        
-        
-    def _prune_duplicate_tracks(self):
-        """
-        Merge any two tracks whose current posteriors are very close.
-        Call this at the end of update().
-        """
-        tids = list(self.tracks.keys())
-        posts = {}
-        for tid in tids:
-            sp = self.tracks[tid]['kf'].statePost
-            posts[tid] = (float(sp[0,0]), float(sp[1,0]))
-        to_drop = set()
-        for i, t1 in enumerate(tids):
-            x1, y1 = posts[t1]
-            for t2 in tids[i+1:]:
-                x2, y2 = posts[t2]
-                if np.hypot(x1-x2, y1-y2) < self.dist_thresh * 0.5:
-                    # mark the higher ID for deletion
-                    to_drop.add(max(t1, t2))
-        for tid in to_drop:
-            del self.tracks[tid]
-
-    def update(self, detections):
-
-        #detections: list of (x, y) centroids
-        #Returns a dict: detection_index -> track_id
-
-        # 1) Predict all tracks forward one step
-        preds = self.predict_all()  # list of (tid, (px, py))
-        track_ids = [t[0] for t in preds]
-        pred_pts   = [t[1] for t in preds]
-
-        # 2) Build cost matrix = Euclidean distance
-        if pred_pts and detections:
-            cost = np.zeros((len(pred_pts), len(detections)), dtype=np.float32)
-            for i, p in enumerate(pred_pts):
-                for j, d in enumerate(detections):
-                    cost[i, j] = np.hypot(p[0] - d[0], p[1] - d[1])
-            row_idx, col_idx = linear_sum_assignment(cost)
-        else:
-            row_idx = np.array([], dtype=int)
-            col_idx = np.array([], dtype=int)
-
-        assigned_detects = {}
-        matched_tracks = set()
-        matched_dets   = set()
-
-        # 3) Associate tracks ↔ detections
-        for r, c in zip(row_idx, col_idx):
-            if cost[r, c] < self.dist_thresh:
-                tid = track_ids[r]
-                matched_tracks.add(tid)
-                matched_dets.add(c)
-                assigned_detects[c] = tid
-
-                # Get the measurement point
-                dpt = detections[c]
-                meas = np.array([[np.float32(dpt[0])], [np.float32(dpt[1])]])
-                
-                # Correct KF with the detection measurement
-                self.tracks[tid]['kf'].correct(meas)
-                self.tracks[tid]['missed'] = 0
-                
-                # Update previous position
-                self.prev_positions[tid] = (dpt[0], dpt[1])
-
-        # 4) Process unassigned detections
-        for i, dpt in enumerate(detections):
-            if i in matched_dets:
-                continue
-                
-            # try to find an existing track under the threshold
-            best_tid, best_dist = None, float('inf')
-            for tid, (px, py) in preds:
-                if tid in matched_tracks:
-                    continue
-                d = np.hypot(dpt[0]-px, dpt[1]-py)
-                if d < best_dist:
-                    best_dist, best_tid = d, tid
-
-            if best_dist < self.dist_thresh:
-                assigned_detects[i] = best_tid
-                self.tracks[best_tid]['missed'] = 0
-                meas = np.array([[np.float32(dpt[0])], [np.float32(dpt[1])]])
-                self.tracks[best_tid]['kf'].correct(meas)
-                
-                # Update previous position
-                self.prev_positions[best_tid] = (dpt[0], dpt[1])
-                matched_tracks.add(best_tid)  # Add to matched tracks
-
-            else:
-                # New track
-                tid = self.next_id
-                kf = self._create_kf(dpt)
-                self.tracks[tid] = {'kf': kf, 'missed': 0}
-                assigned_detects[i] = tid
-                self.prev_positions[tid] = (dpt[0], dpt[1])  # Initialize position
-                matched_tracks.add(tid)  # Add to matched tracks
-                self.next_id += 1
-
-        # 5) Handle unmatched tracks
-        for tid in list(self.tracks.keys()):
-            if tid not in matched_tracks:
-                self.tracks[tid]['missed'] += 1
-                # Increase uncertainty when missing detections
-                noise_scale = min(2.0, 1.0 + self.tracks[tid]['missed'] * 0.2)
-                
-                # FIXED: Preserve matrix type and structure
-                kf = self.tracks[tid]['kf']
-                new_noise = kf.processNoiseCov.copy()
-                new_noise *= noise_scale
-                kf.processNoiseCov = new_noise
-                    
-                # Remove track if missed too many times
-                if self.tracks[tid]['missed'] > self.max_missed:
-                    del self.tracks[tid]
-                    if tid in self.prev_positions:
-                        del self.prev_positions[tid]
-
-        return assigned_detects
-
-
 # --- MAIN PROCESSING -----------------------------------------------------
 def bbox_in_source_coordinates(coords, processed_size, source_size):
     """Map a detector bounding box back to the source video's pixel space."""
@@ -681,7 +575,7 @@ def oriented_box_in_source_coordinates(xywhr, processed_size, source_size):
     )
 
 
-def iter_primary_detections(result, class_names):
+def iter_primary_detections(result, class_names, image, is_motion=False):
     """Yield enclosing rectangles from standard or oriented YOLO results."""
     boxes = result.obb if oriented and result.obb is not None else result.boxes
     # Be tolerant of an OBB model paired with an older config that omitted
@@ -699,12 +593,131 @@ def iter_primary_detections(result, class_names):
             'primary_conf': float(box.conf[0]),
         }
         if using_oriented_boxes:
-            prediction['oriented_bbox'] = tuple(
+            cx, cy, box_width, box_height, angle = (
                 float(value) for value in box.xywhr[0].tolist()
             )
+            head, tail, width = bg.head_tail_width_from_xywhr_rad(
+                cx, cy, box_width, box_height, angle
+            )
+            head, tail, width = _disambiguate_head_tail(
+                image, head, tail, width, prediction['primary_class'], is_motion
+            )
+            prediction.update(head=head, tail=tail, width=width)
         else:
-            prediction['oriented_bbox'] = None
+            prediction.update(head=None, tail=None, width=None)
         yield prediction
+
+
+def oriented_box_from_detection(det):
+    """Return canonical (center, length, width, angle) geometry for a merged OBB."""
+    head, tail = det.get('head'), det.get('tail')
+    if head is None or tail is None:
+        return None
+    dx, dy = head[0] - tail[0], head[1] - tail[1]
+    return (
+        0.5 * (head[0] + tail[0]),
+        0.5 * (head[1] + tail[1]),
+        float(np.hypot(dx, dy)),
+        float(det['width']),
+        float(np.arctan2(dy, dx)),
+    )
+
+
+def draw_detection_overlay(frame, det, track_id):
+    """Draw the same axis-aligned or oriented annotation used by the GUI."""
+    source = det.get('source', '')
+    primary_class = (
+        det.get('primary_static_class', '')
+        if source == 'static'
+        else det.get('primary_motion_class', '')
+    )
+    primary_color = primary_colors[primary_classes.index(primary_class)]
+    secondary_class = primary_class
+    secondary_color = (255, 255, 255)
+    for candidate in (
+        det.get('secondary_motion_class', ''),
+        det.get('secondary_static_class', ''),
+    ):
+        if candidate and candidate != primary_class:
+            secondary_class = candidate
+            secondary_color = secondary_colors[secondary_classes.index(candidate)]
+
+    if oriented and det.get('head') is not None:
+        corners = bg.corners_from_head_tail_width(
+            det['head'], det['tail'], det['width']
+        )
+        if not hierarchical_mode or primary_class in ignore_secondary:
+            label = f"{track_id} {primary_class.upper()}"
+            bg.draw_oriented_box(
+                frame,
+                corners,
+                det['head'],
+                primary_color,
+                thickness=line_thickness,
+                label=label,
+                label_color=primary_color,
+            )
+        else:
+            outer_thickness = line_thickness + 2
+            outer_corners = bg.inset_corners(corners, -outer_thickness)
+            cv2.polylines(
+                frame,
+                [np.array(outer_corners, dtype=np.int32)],
+                True,
+                primary_color,
+                outer_thickness,
+                cv2.LINE_AA,
+            )
+            label = [
+                (f"{track_id} {primary_class.upper()} ", primary_color),
+                (secondary_class, secondary_color),
+            ]
+            bg.draw_oriented_box(
+                frame,
+                bg.inset_corners(corners, -1),
+                det['head'],
+                secondary_color,
+                thickness=line_thickness + 1,
+                label=label,
+            )
+        return primary_color
+
+    x1, y1, x2, y2 = det['coords']
+    if not hierarchical_mode or primary_class in ignore_secondary:
+        label = f"{track_id} {primary_class.upper()}"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), primary_color, line_thickness)
+        bg.draw_label_with_background(
+            frame,
+            [(label, primary_color)],
+            x1,
+            y1,
+            font_size,
+            line_thickness,
+        )
+    else:
+        outer_thickness = line_thickness + 2
+        cv2.rectangle(
+            frame,
+            (x1 - outer_thickness, y1 - outer_thickness),
+            (x2 + outer_thickness, y2 + outer_thickness),
+            primary_color,
+            outer_thickness,
+        )
+        cv2.rectangle(
+            frame,
+            (x1 - 1, y1 - 1),
+            (x2 + 1, y2 + 1),
+            secondary_color,
+            line_thickness + 1,
+        )
+        label = [
+            (f"{track_id} {primary_class.upper()} ", primary_color),
+            (secondary_class, secondary_color),
+        ]
+        bg.draw_label_with_background(
+            frame, label, x1, y1, font_size, line_thickness
+        )
+    return primary_color
 
 
 def process_video(file, viz=False, export_crop_manifest=False):
@@ -726,32 +739,61 @@ def process_video(file, viz=False, export_crop_manifest=False):
             cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h)
         )
 
+    detect_task = "obb" if oriented else "detect"
     if primary_static_classes[0] != '0':
         if use_ncnn == 'true':
-            model_static = load_model_with_ncnn_preference(primary_static_model_path)
+            model_static = load_model_with_ncnn_preference(
+                primary_static_model_path, detect_task
+            )
         else:
             model_static = YOLO(primary_static_model_path)
          
     if primary_motion_classes[0] != '0':
         if use_ncnn == 'true':
-            model_motion = load_model_with_ncnn_preference(primary_motion_model_path)
+            model_motion = load_model_with_ncnn_preference(
+                primary_motion_model_path, detect_task
+            )
         else:
             model_motion = YOLO(primary_motion_model_path)
         
         
-    tracker = KalmanTracker(match_distance_thresh, delete_after_missed)
+    tracker = KalmanTracker(
+        match_distance_ratio,
+        delete_after_missed,
+        process_noise_pos_ratio,
+        process_noise_vel_ratio,
+        measurement_noise_ratio,
+        merge_aware=merge_aware,
+        frames_per_step=frame_skip + 1,
+    )
+    motion_processor = MotionProcessor(
+        history_frames=motion_history_frames,
+        frame_gap=motion_frame_gap,
+        strategy=strategy,
+        exp_a=expA,
+        exp_b=expB,
+        lum_weight=lum_weight,
+        rgb_multipliers=rgb_multipliers,
+        motion_threshold=motion_threshold,
+        chromatic_tail_only=chromatic_tail_only == 'true',
+        median_window=sliding_median_window,
+        median_signed_color=sliding_median_signed_color,
+    )
 
-    prev_frames, frame_idx = None, 0
+    frame_idx = 0
     csv_file = open(os.path.join(output_folder, base + "_tracking.csv"), 'w', newline='')
     csv_writer = csv.writer(csv_file)
     # Updated CSV header with four streams
-    csv_writer.writerow([
+    csv_header = [
         "frame", "id", "x", "y",
         "primary_static_class", "primary_static_conf",
         "primary_motion_class", "primary_motion_conf",
         "secondary_static_class", "secondary_static_conf",
         "secondary_motion_class", "secondary_motion_conf"
-    ])
+    ]
+    if oriented:
+        csv_header += ["angle_deg", "width", "length"]
+    csv_writer.writerow(csv_header)
 
     crop_manifest_file = None
     crop_manifest_writer = None
@@ -772,6 +814,7 @@ def process_video(file, viz=False, export_crop_manifest=False):
     print(f"Processing video: {file}")
     print('Initialising')
     current_frame = 0
+    current_fps = 0.0
     print_tick = 0
     start_time = time.time()
 
@@ -781,44 +824,21 @@ def process_video(file, viz=False, export_crop_manifest=False):
         ret, raw_frame = cap.read()
         if not ret: break
         frame_idx += 1
+        if scale_factor != 1.0:
+            raw_frame = cv2.resize(raw_frame, None, fx=scale_factor, fy=scale_factor)
+        motion_candidate = (
+            motion_processor.update(raw_frame)
+            if primary_motion_classes[0] != '0'
+            else None
+        )
         if frame_count == 0:
-            if scale_factor != 1.0:
-                raw_frame = cv2.resize(raw_frame, None, fx=scale_factor, fy=scale_factor)
-            gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
             frame = raw_frame.copy()
-            if prev_frames is None:
-                prev_frames = [gray.copy() for _ in range(3)]
+            if primary_motion_classes[0] != '0' and motion_candidate is None:
+                frame_count += 1
+                if frame_count > frame_skip:
+                    frame_count = 0
                 continue
-            
-            # only process motion information if necessary
-            if primary_motion_classes[0] != '0':
-    
-                diffs = [cv2.absdiff(prev_frames[j], gray) for j in range(3)]
-                
-                if strategy == 'exponential':
-                    prev_frames[0] = gray
-                    prev_frames[1] = cv2.addWeighted(prev_frames[1], expA, gray, expA2, 0)
-                    prev_frames[2] = cv2.addWeighted(prev_frames[2], expB, gray, expB2, 0)
-                elif strategy == 'sequential':
-                    prev_frames[2] = prev_frames[1]
-                    prev_frames[1] = prev_frames[0]
-                    prev_frames[0] = gray
-
-
-                if chromatic_tail_only == 'true':
-                    tb = cv2.subtract(diffs[0], diffs[1])   
-                    tr = cv2.subtract(diffs[2], diffs[1])
-                    tg = cv2.subtract(diffs[1], diffs[0])
-                            
-                    blue = cv2.addWeighted(gray, lum_weight, tb, rgb_multipliers[2], motion_threshold)
-                    green = cv2.addWeighted(gray, lum_weight, tg, rgb_multipliers[1], motion_threshold)
-                    red = cv2.addWeighted(gray, lum_weight, tr, rgb_multipliers[0], motion_threshold)
-                else:
-                    blue = cv2.addWeighted(gray, lum_weight, diffs[0], rgb_multipliers[2], motion_threshold)
-                    green = cv2.addWeighted(gray, lum_weight, diffs[1], rgb_multipliers[1], motion_threshold)
-                    red = cv2.addWeighted(gray, lum_weight, diffs[2], rgb_multipliers[0], motion_threshold)
-
-                motion_image = cv2.merge((blue, green, red)).astype(np.uint8)
+            motion_image = motion_candidate
     
             # Collect all primary detections
             all_detections = []
@@ -827,7 +847,7 @@ def process_video(file, viz=False, export_crop_manifest=False):
             if primary_static_classes[0] != '0':
                 results_static = model_static.predict(frame, conf=primary_conf_thresh, verbose=False)
                 for prediction in iter_primary_detections(
-                    results_static[0], primary_static_classes
+                    results_static[0], primary_static_classes, frame, is_motion=False
                 ):
                     all_detections.append({
                         **prediction,
@@ -840,7 +860,7 @@ def process_video(file, viz=False, export_crop_manifest=False):
             if primary_motion_classes[0] != '0':
                 results_motion = model_motion.predict(motion_image, conf=primary_conf_thresh, verbose=False)
                 for prediction in iter_primary_detections(
-                    results_motion[0], primary_motion_classes
+                    results_motion[0], primary_motion_classes, motion_image, is_motion=True
                 ):
                     all_detections.append({
                         **prediction,
@@ -850,99 +870,15 @@ def process_video(file, viz=False, export_crop_manifest=False):
                     })
     
     
-            # Merge detections based on proximity
-            merged_detections = []
-            for det in all_detections:
-                x1, y1, x2, y2 = det['coords']
-                cx, cy = (x1+x2)//2, (y1+y2)//2
-                
-                # Find matching existing detection
-                matched = False
-                for md in merged_detections:
-                    md_cx, md_cy = md['centroid']
-                    dist = np.hypot(cx - md_cx, cy - md_cy)
-                    
-                    # Calculate IOU
-                    md_x1, md_y1, md_x2, md_y2 = md['coords']
-                    overlap = iou((x1, y1, x2, y2), (md_x1, md_y1, md_x2, md_y2))
-                    ms_source = md['source']
-                    
-                    if dist < centroid_merge_thresh or overlap > iou_thresh:
-                        # Merge classes - keep highest confidence detection for each source
-                        if det['source'] == ms_source or dominant_source == 'confidence': # mathcing sources so select best, or confidence strategy used
-                            if det['source'] == 'static':
-                                # Keep highest confidence static detection
-                                if 'primary_conf' not in md or det['primary_conf'] > md['primary_conf']:
-                                    md['primary_class_combined'] = md['primary_class'] # retain the combined primary
-                                    md['primary_conf_combined'] = md['primary_conf']
-                                    md['primary_class'] = det['primary_class']
-                                    md['primary_conf'] = det['primary_conf']
-                                    md['coords'] = det['coords']  # Update to higher conf box
-                                    md['oriented_bbox'] = det.get('oriented_bbox')
-                                    md['centroid'] = (cx, cy)
-                                    md['source'] = det['source']
-                            else:  # motion source
-                                # Keep highest confidence motion detection
-                                if 'primary_conf' not in md or det['primary_conf'] > md['primary_conf']:
-                                    md['primary_class_combined'] = md['primary_class'] # retain the combined primary
-                                    md['primary_conf_combined'] = md['primary_conf']
-                                    md['primary_class'] = det['primary_class']
-                                    md['primary_conf'] = det['primary_conf']
-                                    md['coords'] = det['coords']  # Update to higher conf box
-                                    md['oriented_bbox'] = det.get('oriented_bbox')
-                                    md['centroid'] = (cx, cy)
-                                    md['source'] = det['source']
-                        elif det['source'] == 'static' and dominant_source == 'static':
-                                # Keep static detection
-                                md['primary_class_combined'] = md['primary_class'] # retain the combined primary
-                                md['primary_conf_combined'] = md['primary_conf']
-                                md['primary_class'] = det['primary_class']
-                                md['primary_conf'] = det['primary_conf']
-                                md['coords'] = det['coords']  # Update to higher conf box
-                                md['oriented_bbox'] = det.get('oriented_bbox')
-                                md['centroid'] = (cx, cy)
-                                md['source'] = det['source']
-                        elif det['source'] == 'motion' and dominant_source == 'motion':
-                                # Keep motion detection
-                                md['primary_class_combined'] = md['primary_class'] # retain the combined primary
-                                md['primary_conf_combined'] = md['primary_conf']
-                                md['primary_class'] = det['primary_class']
-                                md['primary_conf'] = det['primary_conf']
-                                md['coords'] = det['coords']  # Update to higher conf box
-                                md['oriented_bbox'] = det.get('oriented_bbox')
-                                md['centroid'] = (cx, cy)
-                                md['source'] = det['source']
-    
-                            
-                        matched = True
-                        break
-                        
-                if not matched:
-                    # Add as new detection
-                    new_det = {
-                        'coords': det['coords'],
-                        'centroid': (cx, cy),
-                        'source': det['source'],
-                        'oriented_bbox': det.get('oriented_bbox'),
-                        'primary_class_combined': '',
-                        'primary_conf_combined': 0.0
-                    }
-                    if det['source'] == 'static':
-                        new_det['primary_class'] = det['primary_class']
-                        new_det['primary_conf'] = det['primary_conf']
-                        # ~ if 'secondary_static_class' in det:
-                            # ~ new_det['secondary_static_class'] = det['secondary_static_class']
-                            # ~ new_det['secondary_static_conf'] = det['secondary_static_conf']
-                    else:  # motion source
-                        new_det['primary_class'] = det['primary_class']
-                        new_det['primary_conf'] = det['primary_conf']
-                        # ~ if 'secondary_motion_class' in det:
-                            # ~ new_det['secondary_motion_class'] = det['secondary_motion_class']
-                            # ~ new_det['secondary_motion_conf'] = det['secondary_motion_conf']
-                    merged_detections.append(new_det)
-    
-    
-    
+            # Use the same canonical, scale-relative merge implementation as
+            # GUI batch processing.
+            merged_detections = bg.merge_source_detections(
+                all_detections,
+                centroid_merge_ratio,
+                iou_thresh,
+                dominant_source,
+            )
+
             # Run secondary classification on each primary detection
             processed_detections = []
             for det in merged_detections:
@@ -999,7 +935,13 @@ def process_video(file, viz=False, export_crop_manifest=False):
                     # Get the cropped region
                     crop = None
                     if crop_img is not None:
-                        crop = crop_img[y1:y2, x1:x2]
+                        if oriented and det.get('head') is not None:
+                            corners = bg.corners_from_head_tail_width(
+                                det['head'], det['tail'], det['width']
+                            )
+                            crop = bg.crop_black_masked(crop_img, corners)
+                        else:
+                            crop = crop_img[y1:y2, x1:x2]
                     
                     secondary_class = primary_class
                     secondary_conf = 1.0
@@ -1023,9 +965,13 @@ def process_video(file, viz=False, export_crop_manifest=False):
                 processed_detections.append(det)
     
     
-            # Prepare for tracking
-            cents = [d['centroid'] for d in processed_detections]
-            assignment = tracker.update(cents)
+            # The GUI tracker gates and scales Kalman noise relative to each
+            # detection's own body size.
+            detections_for_tracker = [
+                (d['centroid'][0], d['centroid'][1], bg.detection_scale(d))
+                for d in processed_detections
+            ]
+            assignment = tracker.update(detections_for_tracker)
     
             # ~ frame = motion_image ## enable this line ot save the motion video instead of static 
     
@@ -1050,64 +996,8 @@ def process_video(file, viz=False, export_crop_manifest=False):
                 p_source = det.get('source', '')
     
     
-                # Create display label
-                label_parts = []
-                # ~ if ps_class: 
-                if p_source == 'static': 
-                    label_parts.append(f"{ps_class.upper()}")
-                    primary_cls = ps_class
-                else:
-                    label_parts.append(f"{pm_class.upper()}")
-                    primary_cls = pm_class
-                
-                primary_col = primary_colors[primary_classes.index(primary_cls)]
-                secondary_col = (255, 255, 255)
-    
-                if hierarchical_mode:
-                    
-                    if sm_class != '' and sm_class != primary_cls:
-                        secondary_cls = sm_class
-                        secondary_col = secondary_colors[secondary_classes.index(secondary_cls)]
-                    if ss_class != '' and ss_class != primary_cls:
-                        secondary_cls = ss_class
-                        secondary_col = secondary_colors[secondary_classes.index(secondary_cls)]
-                    
-    
-                    if primary_cls in ignore_secondary:
-                        label = f"{tid} {primary_cls.upper()}"
-                        label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_size, line_thickness)
-                        label_w, label_h = label_size
-                        cv2.rectangle(frame, (x1-line_thickness, y1 - label_h - line_thickness*4), (x1 + label_w + line_thickness*2, y1), (0, 0, 0), -1)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), primary_col, line_thickness)
-                        cv2.putText(frame, label, (x1, y1 - line_thickness*2), cv2.FONT_HERSHEY_SIMPLEX, 
-                                    font_size, primary_col, line_thickness, cv2.LINE_AA)
-                    else:
-                        # Draw outer static box (slightly larger)
-                        outer_thickness = line_thickness + 2
-                        cv2.rectangle(frame, (x1-outer_thickness, y1-outer_thickness), 
-                                     (x2+outer_thickness, y2+outer_thickness), 
-                                    primary_col, outer_thickness)
-                        label = f"{tid} {primary_cls.upper()} {secondary_cls}"
-                        label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_size, line_thickness)
-                        label_w, label_h = label_size
-                        cv2.rectangle(frame, (x1-line_thickness, y1 - label_h - line_thickness*4), (x1 + label_w + line_thickness*2, y1), (0, 0, 0), -1)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), secondary_col, line_thickness)
-                        cv2.putText(frame, label, (x1, y1 - line_thickness*2), cv2.FONT_HERSHEY_SIMPLEX, 
-                                    font_size, secondary_col, line_thickness, cv2.LINE_AA)
-                else:
-                    label = f"{tid} {primary_cls}"
-                    label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_size, line_thickness)
-                    label_w, label_h = label_size
-                    cv2.rectangle(frame, (x1-line_thickness, y1 - label_h - line_thickness*4), (x1 + label_w + line_thickness*2, y1), (0, 0, 0), -1)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), primary_col, line_thickness)
-                    cv2.putText(frame, label, (x1, y1 - line_thickness*3), cv2.FONT_HERSHEY_SIMPLEX, 
-                                font_size, primary_col, line_thickness, cv2.LINE_AA)
-    
-    
-    
-        
-                # Draw motion vector (if tracking available)
-                if tid in tracker.tracks:
+                if viz:
+                    primary_col = draw_detection_overlay(frame, det, tid)
                     state_post = tracker.tracks[tid]['kf'].statePost
                     x, y = state_post[0, 0], state_post[1, 0]
                     vx, vy = state_post[2, 0], state_post[3, 0]
@@ -1119,14 +1009,27 @@ def process_video(file, viz=False, export_crop_manifest=False):
                     cv2.circle(frame, (int(next_x), int(next_y)), 3, light_color, -line_thickness)
                     cv2.circle(frame, (int(cx), int(cy)), 3, primary_col, -line_thickness)
                 
-                # Write to CSV
-                csv_writer.writerow([
+                # Write the same tracking columns as GUI batch processing.
+                csv_row = [
                     frame_idx, tid, cx, cy,
                     ps_class, f"{ps_conf:.3f}",
                     pm_class, f"{pm_conf:.3f}",
                     ss_class, f"{ss_conf:.3f}",
                     sm_class, f"{sm_conf:.3f}"
-                ])
+                ]
+                if oriented:
+                    if det.get('head') is not None:
+                        angle_deg, length = bg.angle_length_from_head_tail(
+                            det['head'], det['tail']
+                        )
+                        csv_row += [
+                            f"{angle_deg:.2f}",
+                            f"{det['width']:.2f}",
+                            f"{length:.2f}",
+                        ]
+                    else:
+                        csv_row += ['', '', '']
+                csv_writer.writerow(csv_row)
 
                 if crop_manifest_writer is not None:
                     source_bbox = bbox_in_source_coordinates(
@@ -1134,7 +1037,7 @@ def process_video(file, viz=False, export_crop_manifest=False):
                         (frame.shape[1], frame.shape[0]),
                         (source_width, source_height),
                     )
-                    oriented_bbox = det.get('oriented_bbox')
+                    oriented_bbox = oriented_box_from_detection(det)
                     if oriented_bbox is not None:
                         source_oriented_bbox = oriented_box_in_source_coordinates(
                             oriented_bbox,
@@ -1153,17 +1056,28 @@ def process_video(file, viz=False, export_crop_manifest=False):
                     ])
 
 
-            # ~ # print frame number
-            text_color = (255, 255, 255)  # white text
-            label = str(current_frame)
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_size, line_thickness)
-            label_w, label_h = label_size
-            cv2.rectangle(frame, (0, 0), 
-                         (label_w + line_thickness*4, label_h + line_thickness*4), (0, 0, 0), -1)
-            cv2.putText(frame, label, (line_thickness*2, label_h + line_thickness*2), 
-                       cv2.FONT_HERSHEY_SIMPLEX, font_size, text_color, line_thickness)
-                           
-            if viz: ## obviously would be more optimal to comment out rectangles above
+            if viz:
+                label = str(current_frame)
+                label_size, _ = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, font_size, line_thickness
+                )
+                label_w, label_h = label_size
+                cv2.rectangle(
+                    frame,
+                    (0, 0),
+                    (label_w + line_thickness * 4, label_h + line_thickness * 4),
+                    (0, 0, 0),
+                    -1,
+                )
+                cv2.putText(
+                    frame,
+                    label,
+                    (line_thickness * 2, label_h + line_thickness * 2),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    font_size,
+                    (255, 255, 255),
+                    line_thickness,
+                )
                 writer.write(frame)
             
             if print_tick > progress_update:
