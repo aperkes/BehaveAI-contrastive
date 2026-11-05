@@ -988,7 +988,9 @@ class VideoCropDataset(Dataset):
         if not self.augment:
             return tensor
         if torch.rand(()) < 0.5:
-            tensor = torch.flip(tensor, dims=(2,))
+            # Reverse both spatial axes together: this is a 180-degree rotation,
+            # not a horizontal mirror that would alter the fish's appearance.
+            tensor = torch.flip(tensor, dims=(1, 2))
         # Mild photometric variation preserves markings better than aggressive jitter.
         brightness = 1.0 + float(torch.empty(1).uniform_(-0.12, 0.12))
         contrast = 1.0 + float(torch.empty(1).uniform_(-0.12, 0.12))
