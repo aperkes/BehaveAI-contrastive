@@ -355,12 +355,12 @@ if len(secondary_static_classes) != len(secondary_static_colors) or len(secondar
 if dominant_source != 'motion' and dominant_source != 'static' and dominant_source != 'confidence':
 	raise ValueError("dominant_source must be motion, static, or confidence")
 
-if len(primary_static_classes) > 0:
+if primary_static_classes[0] != '0':
 	if not os.path.exists(primary_static_yaml_path):
 		print(f"Error: Primary static YAML file not found. Run the Annotation script once to fix this")
 		sys.exit(1)
 
-if len(primary_motion_classes) > 0:
+if primary_motion_classes[0] != '0':
 	if not os.path.exists(primary_motion_yaml_path):
 		print(f"Error: Primary motion YAML file not found. Run the Annotation script once to fix this")
 		sys.exit(1)
