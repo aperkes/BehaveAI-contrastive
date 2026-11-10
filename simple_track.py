@@ -816,7 +816,7 @@ def process_video(file, viz=False, export_crop_manifest=False):
         crop_manifest_file = open(crop_manifest_path, 'w', newline='')
         crop_manifest_writer = csv.writer(crop_manifest_file)
         crop_manifest_writer.writerow([
-            "source_video", "frame", "track_id", "x1", "y1", "x2", "y2",
+            "source_video", "frame", "frame_step", "track_id", "x1", "y1", "x2", "y2",
             "obb_cx", "obb_cy", "obb_width", "obb_height", "obb_angle_radians",
             "detection_source",
             "primary_static_class", "primary_static_conf",
@@ -1061,7 +1061,7 @@ def process_video(file, viz=False, export_crop_manifest=False):
                     else:
                         source_oriented_bbox = ('', '', '', '', '')
                     crop_manifest_writer.writerow([
-                        os.path.abspath(file), frame_idx, tid, *source_bbox,
+                        os.path.abspath(file), frame_idx, frame_skip + 1, tid, *source_bbox,
                         *source_oriented_bbox, p_source,
                         ps_class, f"{ps_conf:.3f}",
                         pm_class, f"{pm_conf:.3f}",

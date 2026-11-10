@@ -81,6 +81,7 @@ class Detection:
     bbox: tuple
     manifest_index: int
     oriented_bbox: tuple | None = None
+    frame_step: int = 1
 
     @property
     def track_key(self):
@@ -149,10 +150,14 @@ def report_progress(label, completed, total, started_at):
     )
 
 
-def read_manifests(manifest_paths, video_overrides=None):
+def read_manifests(manifest_paths, video_overrides=None, frame_step_overrides=None):
     """Read one or more crop manifests and return detections plus raw rows."""
     if video_overrides and len(video_overrides) != len(manifest_paths):
         raise ValueError("Provide one --video for each --manifest, or omit --video.")
+    if frame_step_overrides and len(frame_step_overrides) not in {1, len(manifest_paths)}:
+        raise ValueError(
+            "Provide --frame-step once for all manifests or once per manifest."
+        )
 
     detections = []
     raw_rows = []
@@ -160,6 +165,13 @@ def read_manifests(manifest_paths, video_overrides=None):
         override = None
         if video_overrides:
             override = os.path.abspath(video_overrides[manifest_number])
+        frame_step_override = None
+        if frame_step_overrides:
+            frame_step_override = (
+                frame_step_overrides[0]
+                if len(frame_step_overrides) == 1
+                else frame_step_overrides[manifest_number]
+            )
 
         with open(manifest_path, newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
@@ -172,6 +184,16 @@ def read_manifests(manifest_paths, video_overrides=None):
 
             for row in reader:
                 video = override or os.path.abspath(row["source_video"])
+                frame_step = int(
+                    frame_step_override
+                    if frame_step_override is not None
+                    else row.get("frame_step") or 1
+                )
+                if frame_step < 1:
+                    raise ValueError(
+                        f"{manifest_path} row {reader.line_num} has invalid "
+                        f"frame_step={frame_step}"
+                    )
                 bbox = tuple(int(float(row[name])) for name in ("x1", "y1", "x2", "y2"))
                 oriented_fields = (
                     "obb_cx",
@@ -198,6 +220,7 @@ def read_manifests(manifest_paths, video_overrides=None):
                     bbox=bbox,
                     manifest_index=len(raw_rows),
                     oriented_bbox=oriented_bbox,
+                    frame_step=frame_step,
                 )
                 detections.append(detection)
                 copied_row = dict(row)
@@ -259,11 +282,19 @@ def build_conservative_training_fragments(
 
     Linear interpolation is used only to expose close encounters during short
     detection gaps. Interpolated locations never become crops and never bridge
-    positive fragments.
+    positive fragments. Continuity and buffer sizes use each video's processed
+    frame step, so regularly skipped source frames remain contiguous.
     """
     observations_by_track = defaultdict(list)
     states_by_video_frame = defaultdict(list)
+    frame_step_by_video = {}
     for index, item in enumerate(detections):
+        previous_step = frame_step_by_video.setdefault(item.video, item.frame_step)
+        if previous_step != item.frame_step:
+            raise ValueError(
+                f"Inconsistent frame_step values for {item.video}: "
+                f"{previous_step} and {item.frame_step}"
+            )
         x1, y1, x2, y2 = item.bbox
         center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
         scale = max(x2 - x1, y2 - y1, 1)
@@ -282,14 +313,18 @@ def build_conservative_training_fragments(
     for track, observations in observations_by_track.items():
         observations.sort()
         video = track[0]
+        frame_step = frame_step_by_video[video]
         for (first_frame, _, first), (last_frame, _, last) in zip(
             observations, observations[1:]
         ):
-            gap = last_frame - first_frame
-            if not 1 < gap <= interpolation_gap + 1:
+            raw_gap = last_frame - first_frame
+            if raw_gap % frame_step:
                 continue
-            for frame in range(first_frame + 1, last_frame):
-                fraction = (frame - first_frame) / gap
+            gap_steps = raw_gap // frame_step
+            if not 1 < gap_steps <= interpolation_gap + 1:
+                continue
+            for frame in range(first_frame + frame_step, last_frame, frame_step):
+                fraction = (frame - first_frame) / raw_gap
                 center = (
                     first["center"][0]
                     + fraction * (last["center"][0] - first["center"][0]),
@@ -339,12 +374,13 @@ def build_conservative_training_fragments(
         frames_by_video[video].append(frame)
     for video, frames in frames_by_video.items():
         frame_set = set(frames)
+        frame_step = frame_step_by_video[video]
         for frame in sorted(frame_set):
-            if frame - 1 not in frame_set:
+            if frame - frame_step not in frame_set:
                 continue
             previous = {
                 state["track"]: state
-                for state in states_by_video_frame[(video, frame - 1)]
+                for state in states_by_video_frame[(video, frame - frame_step)]
             }
             current = {
                 state["track"]: state
@@ -389,13 +425,17 @@ def build_conservative_training_fragments(
     # Abrupt deviations from constant velocity are another indication that an
     # online track may have transferred to a neighboring animal.
     for track, observations in observations_by_track.items():
+        frame_step = frame_step_by_video[track[0]]
         for first, second, third in zip(
             observations, observations[1:], observations[2:]
         ):
             first_frame, _, first_state = first
             second_frame, _, second_state = second
             third_frame, _, third_state = third
-            if second_frame != first_frame + 1 or third_frame != second_frame + 1:
+            if (
+                second_frame != first_frame + frame_step
+                or third_frame != second_frame + frame_step
+            ):
                 continue
             predicted = (
                 2 * second_state["center"][0] - first_state["center"][0],
@@ -410,9 +450,11 @@ def build_conservative_training_fragments(
 
     expanded_uncertain = defaultdict(set)
     for track, frames in uncertain.items():
+        frame_step = frame_step_by_video[track[0]]
         for frame in frames:
             expanded_uncertain[track].update(
-                range(frame - uncertainty_buffer, frame + uncertainty_buffer + 1)
+                frame + offset * frame_step
+                for offset in range(-uncertainty_buffer, uncertainty_buffer + 1)
             )
 
     fragment_keys = []
@@ -421,6 +463,7 @@ def build_conservative_training_fragments(
     detection_to_fragment = {}
     excluded = 0
     for track, observations in sorted(observations_by_track.items()):
+        frame_step = frame_step_by_video[track[0]]
         current = []
         previous_frame = None
 
@@ -445,7 +488,10 @@ def build_conservative_training_fragments(
             unsafe = frame in expanded_uncertain[track]
             # Positive fragments contain consecutive observed detections only;
             # interpolation is deliberately never used to join them.
-            if unsafe or (previous_frame is not None and frame != previous_frame + 1):
+            if unsafe or (
+                previous_frame is not None
+                and frame != previous_frame + frame_step
+            ):
                 finish_fragment()
             if unsafe:
                 excluded += 1
@@ -2927,6 +2973,15 @@ def build_parser():
         action="append",
         help="source video override; provide one per manifest, or use paths stored in manifests",
     )
+    parser.add_argument(
+        "--frame-step",
+        action="append",
+        type=int,
+        help=(
+            "processed-frame interval for an older manifest without frame_step; "
+            "give once for all manifests or once per manifest"
+        ),
+    )
     parser.add_argument("--output-dir", default="./contrastive_output")
     parser.add_argument(
         "--checkpoint",
@@ -3194,6 +3249,11 @@ def validate_args(args, parser):
         parser.error(f"--num-individuals is required in {args.mode} mode")
     if args.checkpoint and args.mode in {"train", "train-predict"}:
         parser.error("Use --init-checkpoint, not --checkpoint, when training.")
+    if args.frame_step:
+        if len(args.frame_step) not in {1, len(args.manifest)}:
+            parser.error("--frame-step must be given once or once per manifest")
+        if any(step < 1 for step in args.frame_step):
+            parser.error("--frame-step must be at least 1")
     if args.pairs_per_batch < 1:
         parser.error("--pairs-per-batch must be at least 1")
     if args.forward_pair_chunk_size < 1:
@@ -3269,7 +3329,9 @@ def main():
     if args.background_subtraction == "median":
         background_store = MedianBackgroundStore(args.background_samples, args.seed)
 
-    detections, raw_rows = read_manifests(args.manifest, args.video)
+    detections, raw_rows = read_manifests(
+        args.manifest, args.video, args.frame_step
+    )
     metadata = build_track_metadata(detections)
     training_fragments = None
     if (
