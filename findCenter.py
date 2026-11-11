@@ -13,6 +13,7 @@ DEFAULT_FRAME = 3000
 FIND_YOUR_CENTER_DIR = Path.home() / "Documents/Scripts/FindYourCenter"
 WHITE_TEMPLATE = FIND_YOUR_CENTER_DIR / "templateWhiteSimple.png"
 BLACK_TEMPLATE = FIND_YOUR_CENTER_DIR / "templateBlackSimple.png"
+FILTER_TEMPLATE = FIND_YOUR_CENTER_DIR / "templateFilterSimple.png"
 VIDEO_NAME = re.compile(r"^(?P<pi>pi\d+)\.(?P<year>\d{4})\.")
 
 
