@@ -1,0 +1,44 @@
+block,date,pi,job,time,event
+1,4/10/26,all,"big, treatment",1:30,B/T Fish in
+1,4/13/26,all,"big, treatment",9:30,PreFight
+1,4/13/26,all,"focal, assay",1:00,F/A Fish in
+1,4/16/26,all,"treatment, focal",10:50,Treatment Fight
+1,4/20/26,all,"focal, assay",11:15,Assay Fight
+1,,17,,,died
+1,,17,"big, assay",,big invaded assay
+1,4/18/26,13,"big, assay",,big invaded assay
+1,4/14/26,13,treatment,,died
+1,4/19/26,17,"focal, assay",,focal invaded assay
+1,4/19/26,19,treatment,,died
+1,4/18/26,21,"assay, big",,assay invaded big
+1,4/20/26,21,assay,,assay back in the right spot. 
+2,4/21/26,all,"big, treatment",1:15,B/T Swap
+2,4/24/26,all,"big, treatment",9:23,PreFight
+2,4/24/26,all,"focal, assay",12:50,F/A Fish Swap
+2,4/27/26,all,"treatment, focal",10:45,Treatment Fight
+2,5/1/26,all,"focal, assay",11:15,Assay Fight
+2,4/27/26,22,"big, focal",,focal invaded big
+2,4/24/26,all,"focal, assay",,removed 
+2,4/27,22,"assay, big",,assay invaded big
+2,5/6/26,18,big,,died
+2,,24,"treatment, focal, assay",,treatment invaded focal
+3,05/29/26,all,treatment,1:00,treatment fish in
+3,06/01/26,all,"treatment, big",9:20,fight start
+3,06/04/26,"all, no(24, 14)","treatment, focal",12:35,fight start
+3,06/09/26,all,"focal, assay",10:30,fight start
+3,06/16/26,all,"focal, assay",,removed 
+3,6/2/26,13,treatment ,,died
+3,6/2/26,13,focal,,removed 
+3,6/3/26,24,big,,died
+3,06/03/26,24,big,,replaced
+3,6/2/26,13,big,,died
+3,6/3/26,13,big,,replaced
+3,6/4/26,13,big,,died
+3,6/14/26,18,big,,died
+3,6/15/26,20,big,,died
+4,6/24/26,all,"treatment, big",,moved in to TS2
+4,06/30/26,all,"treatment, big",9:10,PreFight
+4,6/30/26,all,"focal, assay",2:00,F/A in 
+4,7/3/26,all,"treatment, focal",10:34,Treatment Fight
+4,7/7/26,all,"focal, assay",10:50,Assay Fight
+4,7/11/26,all,"focal, assay, big, treatment",,moved into home tank

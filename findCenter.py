@@ -9,7 +9,6 @@ import cv2
 
 
 PAD_TOP = 300
-DEFAULT_FRAME = 3000
 FIND_YOUR_CENTER_DIR = Path.home() / "Documents/Scripts/FindYourCenter"
 WHITE_TEMPLATE = FIND_YOUR_CENTER_DIR / "templateWhiteSimple.png"
 BLACK_TEMPLATE = FIND_YOUR_CENTER_DIR / "templateBlackSimple.png"
@@ -26,7 +25,7 @@ def default_template(video_path):
     return WHITE_TEMPLATE
 
 
-def find_video_center(video_path, template_path=None, frame_number=DEFAULT_FRAME):
+def find_video_center(video_path, template_path=None, frame_number=None):
     """Return ``(x, y)`` in original-video coordinates plus the match score."""
     video_path = Path(video_path).expanduser().resolve()
     template_path = Path(template_path or default_template(video_path)).expanduser()
@@ -35,6 +34,8 @@ def find_video_center(video_path, template_path=None, frame_number=DEFAULT_FRAME
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    if frame_number is None:
+        frame_number = frame_count // 2
     target_frame = min(frame_number, max(0, frame_count - 1))
     capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
     success, image = capture.read()
@@ -77,7 +78,9 @@ def build_parser():
     parser.add_argument("video", help="input video")
     parser.add_argument("--template", help="override the automatically selected template")
     parser.add_argument(
-        "--frame", type=int, default=DEFAULT_FRAME, help="frame used for template matching"
+        "--frame",
+        type=int,
+        help="frame used for template matching (default: middle frame)",
     )
     parser.add_argument(
         "--show-score", action="store_true", help="also print the template-match score"
@@ -88,7 +91,7 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    if args.frame < 0:
+    if args.frame is not None and args.frame < 0:
         parser.error("--frame cannot be negative")
     center, score = find_video_center(args.video, args.template, args.frame)
     print(f"{center[0]:.1f},{center[1]:.1f}")

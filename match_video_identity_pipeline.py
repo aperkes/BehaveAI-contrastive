@@ -83,6 +83,16 @@ def build_parser():
         metavar=("WIDTH", "HEIGHT"),
         help="custom inclusion size; implies --exclude-edges",
     )
+    parser.add_argument(
+        "--force-recompute",
+        action="store_true",
+        help="rerun tracking, training, and embedding even when outputs exist",
+    )
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="render the first 10 minutes of each video with matched identities",
+    )
     return parser
 
 
@@ -118,12 +128,14 @@ def main():
 
     tracking_root = output_dir / "tracking"
     matching_dir = output_dir / "matched"
+    shared_checkpoint = matching_dir / "shared_model" / "contrastive_identity.pt"
     manifests = []
 
     for position, video in enumerate(videos, start=1):
         tracking_dir = tracking_root / video.stem
         tracking_dir.mkdir(parents=True, exist_ok=True)
         manifest = tracking_dir / f"{video.stem}_crop_manifest.csv"
+        completion_marker = tracking_dir / ".tracking_complete"
         tracking_command = [
             sys.executable,
             SCRIPT_DIR / "simple_track.py",
@@ -135,7 +147,21 @@ def main():
             tracking_dir,
             "--export-crop-manifest",
         ]
-        run_stage(f"Tracking video {position}/{len(videos)}", tracking_command)
+        reusable = (
+            manifest.is_file()
+            and manifest.stat().st_size > 0
+            and (completion_marker.is_file() or shared_checkpoint.is_file())
+            and not args.force_recompute
+        )
+        if reusable:
+            print(
+                f"\n=== Reusing tracking video {position}/{len(videos)} ===\n{manifest}",
+                flush=True,
+            )
+            completion_marker.touch()
+        else:
+            run_stage(f"Tracking video {position}/{len(videos)}", tracking_command)
+            completion_marker.touch()
         manifests.append(manifest)
 
     matching_command = [
@@ -166,7 +192,46 @@ def main():
         matching_command.append("--exclude-edges")
     if args.inclusion_size:
         matching_command.extend(("--inclusion-size", *args.inclusion_size))
-    run_stage("Training and matching cross-video identities", matching_command)
+    if args.force_recompute:
+        matching_command.append("--force-recompute")
+    run_stage("Resolving cross-video identities", matching_command)
+
+    if args.visualize:
+        visualization_dir = output_dir / "visualizations"
+        for position, video in enumerate(videos, start=1):
+            predictions = matching_dir / video.stem / "identity_predictions.csv"
+            overlay = visualization_dir / f"{video.stem}_identity_overlay_10min.mp4"
+            reusable = (
+                overlay.is_file()
+                and predictions.is_file()
+                and overlay.stat().st_mtime >= predictions.stat().st_mtime
+                and not args.force_recompute
+            )
+            if reusable:
+                print(
+                    f"\n=== Reusing visualization {position}/{len(videos)} ===\n"
+                    f"{overlay}",
+                    flush=True,
+                )
+                continue
+            overlay_command = [
+                sys.executable,
+                SCRIPT_DIR / "identity_overlay.py",
+                "--video",
+                video,
+                "--predictions",
+                predictions,
+                "--output",
+                overlay,
+                "-ss",
+                0,
+                "-t",
+                600,
+            ]
+            run_stage(
+                f"Rendering visualization {position}/{len(videos)}",
+                overlay_command,
+            )
 
     print(f"\nCross-video identity pipeline complete: {output_dir}", flush=True)
     print(f"Matched predictions and mapping: {matching_dir}", flush=True)

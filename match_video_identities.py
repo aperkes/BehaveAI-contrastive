@@ -140,6 +140,11 @@ def build_parser():
             f"{DEFAULT_INCLUSION_SIZE[1]:g})"
         ),
     )
+    parser.add_argument(
+        "--force-recompute",
+        action="store_true",
+        help="ignore reusable checkpoints and local embedding outputs",
+    )
     return parser
 
 
@@ -148,6 +153,28 @@ def run_command(label, command):
     print(f"\n=== {label} ===", flush=True)
     print(shlex.join(command), flush=True)
     subprocess.run(command, check=True)
+
+
+def saved_identity_count(output_dir, latent_csv):
+    """Return the identity count recorded by a completed local prediction."""
+    quality_path = output_dir / "identity_assignment_quality.json"
+    if quality_path.is_file():
+        quality = json.loads(quality_path.read_text(encoding="utf-8"))
+        if quality.get("num_individuals") is not None:
+            return int(quality["num_individuals"])
+
+    identities = set()
+    with latent_csv.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if "predicted_identity" not in (reader.fieldnames or ()):
+            return None
+        for row in reader:
+            identity = int(row["predicted_identity"])
+            if identity >= 0:
+                identities.add(identity)
+    if identities and identities == set(range(max(identities) + 1)):
+        return len(identities)
+    return None
 
 
 def manifest_video(path):
@@ -643,6 +670,7 @@ def main():
 
     all_fish = {fish_id for video in videos for fish_id in video.fish_ids}
     shared_dir = output_dir / "shared_model"
+    checkpoint = shared_dir / "contrastive_identity.pt"
     train_command = [
         sys.executable,
         SCRIPT_DIR / "contrastive_identity.py",
@@ -665,12 +693,17 @@ def main():
         train_command.extend(("--epochs", args.epochs))
     if args.background_subtraction:
         train_command.extend(("--background-subtraction", "median"))
-    run_command("Training shared contrastive encoder", train_command)
+    reused_checkpoint = checkpoint.is_file() and not args.force_recompute
+    if reused_checkpoint:
+        print(f"\n=== Reusing shared contrastive encoder ===\n{checkpoint}", flush=True)
+    else:
+        run_command("Training shared contrastive encoder", train_command)
 
-    checkpoint = shared_dir / "contrastive_identity.pt"
     for position, video in enumerate(videos, start=1):
         local_output = output_dir / "local" / video.stem
         latent_csv = local_output / "latents.csv"
+        prediction_csv = local_output / "identity_predictions.csv"
+        expected_identities = len(video.fish_ids)
         predict_command = [
             sys.executable,
             SCRIPT_DIR / "contrastive_identity.py",
@@ -683,7 +716,7 @@ def main():
             "--checkpoint",
             checkpoint,
             "--num-individuals",
-            len(video.fish_ids),
+            expected_identities,
             "--export-latents",
             latent_csv,
             "--latent-projection",
@@ -691,11 +724,53 @@ def main():
             "--device",
             args.device,
         ]
-        run_command(
-            f"Predicting local identities {position}/{len(videos)}", predict_command
+        can_reuse_embeddings = (
+            reused_checkpoint
+            and latent_csv.is_file()
+            and not args.force_recompute
         )
+        if can_reuse_embeddings:
+            saved_count = saved_identity_count(local_output, latent_csv)
+            if saved_count == expected_identities and prediction_csv.is_file():
+                print(
+                    f"\n=== Reusing local identities {position}/{len(videos)} ===\n"
+                    f"{latent_csv}",
+                    flush=True,
+                )
+            else:
+                reassign_command = [
+                    sys.executable,
+                    SCRIPT_DIR / "contrastive_identity.py",
+                    "--mode",
+                    "reassign",
+                    "--manifest",
+                    video.manifest,
+                    "--output-dir",
+                    local_output,
+                    "--checkpoint",
+                    checkpoint,
+                    "--reuse-latents",
+                    latent_csv,
+                    "--num-individuals",
+                    expected_identities,
+                    "--export-latents",
+                    latent_csv,
+                    "--latent-projection",
+                    "none",
+                    "--device",
+                    args.device,
+                ]
+                run_command(
+                    f"Reassigning saved embeddings {position}/{len(videos)} "
+                    f"({saved_count or 'unknown'} -> {expected_identities} identities)",
+                    reassign_command,
+                )
+        else:
+            run_command(
+                f"Predicting local identities {position}/{len(videos)}", predict_command
+            )
         video.local_output = local_output
-        video.prediction_csv = local_output / "identity_predictions.csv"
+        video.prediction_csv = prediction_csv
         video.latent_csv = latent_csv
         load_cluster_data(video)
 

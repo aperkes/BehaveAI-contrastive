@@ -225,6 +225,19 @@ def read_manifests(manifest_paths, video_overrides=None, frame_step_overrides=No
                 detections.append(detection)
                 copied_row = dict(row)
                 copied_row["source_video"] = video
+                source_id = (
+                    copied_row.get("original_id")
+                    or copied_row.get("id")
+                    or copied_row["track_id"]
+                )
+                copied_row["id"] = copied_row.get("id") or source_id
+                copied_row["original_id"] = source_id
+                copied_row["x"] = copied_row.get("x") or str(
+                    int((bbox[0] + bbox[2]) / 2)
+                )
+                copied_row["y"] = copied_row.get("y") or str(
+                    int((bbox[1] + bbox[3]) / 2)
+                )
                 raw_rows.append(copied_row)
 
     if not detections:
@@ -1777,6 +1790,45 @@ def extract_embeddings(
     return np.concatenate(embeddings, axis=0)
 
 
+def read_latent_embeddings(path, detections):
+    """Load saved detection embeddings and verify manifest row alignment."""
+    path = Path(path)
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        latent_fields = sorted(
+            name for name in (reader.fieldnames or ()) if name.startswith("latent_")
+        )
+        if not latent_fields:
+            raise ValueError(f"No latent coordinates found in {path}")
+        embeddings = np.empty(
+            (len(detections), len(latent_fields)), dtype=np.float32
+        )
+        count = 0
+        for count, row in enumerate(reader, start=1):
+            if count > len(detections):
+                raise ValueError(
+                    f"{path} has more rows than its crop manifest; cannot resume safely."
+                )
+            detection = detections[count - 1]
+            if (
+                int(row["frame"]) != detection.frame
+                or row["track_id"] != detection.track_id
+                or os.path.abspath(row["source_video"]) != detection.video
+            ):
+                raise ValueError(
+                    f"{path} row {count + 1} does not match its crop manifest; "
+                    "rerun prediction instead of reusing these embeddings."
+                )
+            embeddings[count - 1] = [float(row[name]) for name in latent_fields]
+    if count != len(detections):
+        raise ValueError(
+            f"{path} contains {count} rows but its crop manifest contains "
+            f"{len(detections)} detections."
+        )
+    print(f"Reusing {count:,} saved detection embeddings from {path}", flush=True)
+    return embeddings
+
+
 def aggregate_tracks(embeddings, detections, track_to_label, track_count):
     track_embeddings = np.zeros((track_count, embeddings.shape[1]), dtype=np.float32)
     counts = np.zeros(track_count, dtype=np.int64)
@@ -2496,16 +2548,26 @@ def project_embeddings(
     raise ValueError(f"Unsupported latent projection method: {method}")
 
 
+def identity_prediction_fields(raw_rows):
+    fields = list(raw_rows[0])
+    for name in ("id", "x", "y", "original_id", "predicted_identity"):
+        if name not in fields:
+            fields.append(name)
+    return fields
+
+
 def write_identity_rows(path, raw_rows, detections, track_to_label, identity_by_track):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(raw_rows[0]) + ["predicted_identity"]
+    fieldnames = identity_prediction_fields(raw_rows)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row, item in zip(raw_rows, detections):
             output = dict(row)
-            output["predicted_identity"] = int(identity_by_track[track_to_label[item.track_key]])
+            identity = int(identity_by_track[track_to_label[item.track_key]])
+            output["id"] = identity
+            output["predicted_identity"] = identity
             writer.writerow(output)
 
 
@@ -2513,12 +2575,13 @@ def write_detection_identity_rows(path, raw_rows, detection_identities):
     """Write identities that may change between fragments of one source track."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(raw_rows[0]) + ["predicted_identity"]
+    fieldnames = identity_prediction_fields(raw_rows)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row, identity in zip(raw_rows, detection_identities):
             output = dict(row)
+            output["id"] = int(identity)
             output["predicted_identity"] = int(identity)
             writer.writerow(output)
 
@@ -2777,18 +2840,20 @@ def run_inference(
     background_store,
     preloaded_crop_store,
     training_fragments,
+    embeddings=None,
 ):
     track_keys, track_to_label, _, _ = metadata
-    embeddings = extract_embeddings(
-        args,
-        model,
-        input_size,
-        detections,
-        metadata,
-        device,
-        background_store,
-        preloaded_crop_store,
-    )
+    if embeddings is None:
+        embeddings = extract_embeddings(
+            args,
+            model,
+            input_size,
+            detections,
+            metadata,
+            device,
+            background_store,
+            preloaded_crop_store,
+        )
     track_embeddings, track_counts = aggregate_tracks(
         embeddings, detections, track_to_label, len(track_keys)
     )
@@ -2887,6 +2952,7 @@ def run_inference(
                 reference,
             )
         quality["assignment_method"] = args.identity_assignment
+        quality["num_individuals"] = args.num_individuals
         quality_path = output_dir / "identity_assignment_quality.json"
         quality_path.write_text(json.dumps(quality, indent=2), encoding="utf-8")
         print(f"Saved identity predictions: {identity_path}")
@@ -2955,6 +3021,7 @@ def build_parser():
             "train-predict",
             "train",
             "predict",
+            "reassign",
             "embed",
             "sample-crops",
             "sample-pairs",
@@ -2986,6 +3053,10 @@ def build_parser():
     parser.add_argument(
         "--checkpoint",
         help="trained network used by predict, embed, or sampling modes",
+    )
+    parser.add_argument(
+        "--reuse-latents",
+        help="saved latents.csv used by reassign mode instead of decoding crops",
     )
     parser.add_argument(
         "--init-checkpoint",
@@ -3243,10 +3314,14 @@ def build_parser():
 
 
 def validate_args(args, parser):
-    if args.mode in {"predict", "embed"} and not args.checkpoint:
+    if args.mode in {"predict", "reassign", "embed"} and not args.checkpoint:
         parser.error(f"--checkpoint is required in {args.mode} mode")
-    if args.mode in {"train-predict", "predict"} and args.num_individuals is None:
+    if args.mode in {"train-predict", "predict", "reassign"} and args.num_individuals is None:
         parser.error(f"--num-individuals is required in {args.mode} mode")
+    if args.mode == "reassign" and not args.reuse_latents:
+        parser.error("--reuse-latents is required in reassign mode")
+    if args.reuse_latents and args.mode != "reassign":
+        parser.error("--reuse-latents can only be used in reassign mode")
     if args.checkpoint and args.mode in {"train", "train-predict"}:
         parser.error("Use --init-checkpoint, not --checkpoint, when training.")
     if args.frame_step:
@@ -3336,7 +3411,10 @@ def main():
     training_fragments = None
     if (
         args.mode in {"train", "train-predict", "sample-pairs"}
-        or (args.mode == "predict" and args.identity_assignment == "idtracker")
+        or (
+            args.mode in {"predict", "reassign"}
+            and args.identity_assignment == "idtracker"
+        )
         or args.export_pair_samples
     ):
         if args.training_fragments == "conservative":
@@ -3421,7 +3499,7 @@ def main():
             training_fragments,
         )
 
-    if args.mode in {"train-predict", "predict", "embed"}:
+    if args.mode in {"train-predict", "predict", "reassign", "embed"}:
         if (
             preloaded_crop_store is not None
             and len(preloaded_crop_store.detection_indices) < len(detections)
@@ -3433,6 +3511,11 @@ def main():
             )
             preloaded_crop_store.release()
             preloaded_crop_store = None
+        reused_embeddings = (
+            read_latent_embeddings(args.reuse_latents, detections)
+            if args.mode == "reassign"
+            else None
+        )
         run_inference(
             args,
             model,
@@ -3444,6 +3527,7 @@ def main():
             background_store,
             preloaded_crop_store,
             training_fragments,
+            reused_embeddings,
         )
 
 
