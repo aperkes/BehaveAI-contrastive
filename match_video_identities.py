@@ -31,6 +31,8 @@ VIDEO_NAME = re.compile(
     r"(?P<day>\d{2})\.(?P<hour>\d{2})\.(?P<minute>\d{2})"
 )
 DEFAULT_INCLUSION_SIZE = (880.0, 1030.0)
+DEFAULT_MAX_TRAINING_CROPS = 250_000
+DEFAULT_MAX_EMBEDDING_CROPS = 250_000
 
 
 @dataclass(frozen=True)
@@ -114,6 +116,18 @@ def build_parser():
         ),
     )
     parser.add_argument(
+        "--max-training-crops",
+        type=int,
+        default=DEFAULT_MAX_TRAINING_CROPS,
+        help="shared training crop cap; 0 uses all eligible crops",
+    )
+    parser.add_argument(
+        "--max-embedding-crops",
+        type=int,
+        default=DEFAULT_MAX_EMBEDDING_CROPS,
+        help="per-video identity embedding crop cap; 0 embeds all eligible crops",
+    )
+    parser.add_argument(
         "--center",
         nargs=2,
         type=float,
@@ -155,13 +169,29 @@ def run_command(label, command):
     subprocess.run(command, check=True)
 
 
-def saved_identity_count(output_dir, latent_csv):
+def shared_training_configuration(args, manifests):
+    return {
+        "manifests": [str(path) for path in manifests],
+        "input_color": args.input_color,
+        "background_subtraction": bool(args.background_subtraction),
+        "max_training_crops": args.max_training_crops,
+    }
+
+
+def saved_identity_count(output_dir, latent_csv, expected_embedding_cap):
     """Return the identity count recorded by a completed local prediction."""
     quality_path = output_dir / "identity_assignment_quality.json"
     if quality_path.is_file():
         quality = json.loads(quality_path.read_text(encoding="utf-8"))
-        if quality.get("num_individuals") is not None:
+        saved_cap = quality.get("max_embedding_crops")
+        if (
+            quality.get("num_individuals") is not None
+            and saved_cap is not None
+            and int(saved_cap) == expected_embedding_cap
+        ):
             return int(quality["num_individuals"])
+        if saved_cap is not None:
+            return None
 
     identities = set()
     with latent_csv.open(newline="", encoding="utf-8") as handle:
@@ -175,6 +205,15 @@ def saved_identity_count(output_dir, latent_csv):
     if identities and identities == set(range(max(identities) + 1)):
         return len(identities)
     return None
+
+
+def saved_embedding_cap(output_dir):
+    quality_path = output_dir / "identity_assignment_quality.json"
+    if not quality_path.is_file():
+        return None
+    quality = json.loads(quality_path.read_text(encoding="utf-8"))
+    value = quality.get("max_embedding_crops")
+    return int(value) if value is not None else None
 
 
 def manifest_video(path):
@@ -620,6 +659,8 @@ def main():
         parser.error("--epochs must be at least 1")
     if args.inclusion_size and any(value <= 0 for value in args.inclusion_size):
         parser.error("--inclusion-size WIDTH and HEIGHT must both be positive")
+    if args.max_training_crops < 0 or args.max_embedding_crops < 0:
+        parser.error("crop caps must be zero (uncapped) or positive")
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -671,6 +712,8 @@ def main():
     all_fish = {fish_id for video in videos for fish_id in video.fish_ids}
     shared_dir = output_dir / "shared_model"
     checkpoint = shared_dir / "contrastive_identity.pt"
+    training_config_path = shared_dir / "training_configuration.json"
+    requested_training_config = shared_training_configuration(args, manifests)
     train_command = [
         sys.executable,
         SCRIPT_DIR / "contrastive_identity.py",
@@ -684,6 +727,8 @@ def main():
         args.input_color,
         "--device",
         args.device,
+        "--max-training-crops",
+        args.max_training_crops,
     ]
     for video in videos:
         train_command.extend(("--manifest", video.manifest))
@@ -693,11 +738,29 @@ def main():
         train_command.extend(("--epochs", args.epochs))
     if args.background_subtraction:
         train_command.extend(("--background-subtraction", "median"))
-    reused_checkpoint = checkpoint.is_file() and not args.force_recompute
+    saved_training_config = None
+    if training_config_path.is_file():
+        saved_training_config = json.loads(
+            training_config_path.read_text(encoding="utf-8")
+        )
+    reusable_configuration = saved_training_config == requested_training_config
+    reused_checkpoint = (
+        checkpoint.is_file()
+        and reusable_configuration
+        and not args.force_recompute
+    )
     if reused_checkpoint:
         print(f"\n=== Reusing shared contrastive encoder ===\n{checkpoint}", flush=True)
     else:
+        if checkpoint.is_file() and not reusable_configuration:
+            print(
+                "Shared training settings changed; retraining while reusing manifests.",
+                flush=True,
+            )
         run_command("Training shared contrastive encoder", train_command)
+        training_config_path.write_text(
+            json.dumps(requested_training_config, indent=2), encoding="utf-8"
+        )
 
     for position, video in enumerate(videos, start=1):
         local_output = output_dir / "local" / video.stem
@@ -723,6 +786,8 @@ def main():
             "none",
             "--device",
             args.device,
+            "--max-embedding-crops",
+            args.max_embedding_crops,
         ]
         can_reuse_embeddings = (
             reused_checkpoint
@@ -730,8 +795,24 @@ def main():
             and not args.force_recompute
         )
         if can_reuse_embeddings:
-            saved_count = saved_identity_count(local_output, latent_csv)
-            if saved_count == expected_identities and prediction_csv.is_file():
+            previous_embedding_cap = saved_embedding_cap(local_output)
+            saved_count = saved_identity_count(
+                local_output, latent_csv, args.max_embedding_crops
+            )
+            if (
+                previous_embedding_cap is not None
+                and previous_embedding_cap != args.max_embedding_crops
+            ):
+                print(
+                    f"Embedding cap changed ({previous_embedding_cap} -> "
+                    f"{args.max_embedding_crops}); recomputing local embeddings.",
+                    flush=True,
+                )
+                run_command(
+                    f"Predicting local identities {position}/{len(videos)}",
+                    predict_command,
+                )
+            elif saved_count == expected_identities and prediction_csv.is_file():
                 print(
                     f"\n=== Reusing local identities {position}/{len(videos)} ===\n"
                     f"{latent_csv}",
@@ -759,6 +840,8 @@ def main():
                     "none",
                     "--device",
                     args.device,
+                    "--max-embedding-crops",
+                    args.max_embedding_crops,
                 ]
                 run_command(
                     f"Reassigning saved embeddings {position}/{len(videos)} "

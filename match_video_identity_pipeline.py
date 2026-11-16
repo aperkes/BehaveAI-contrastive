@@ -9,6 +9,8 @@ from pathlib import Path
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_MAX_TRAINING_CROPS = 250_000
+DEFAULT_MAX_EMBEDDING_CROPS = 250_000
 
 
 def build_parser():
@@ -64,6 +66,18 @@ def build_parser():
         help="minimum location compatibility required for an identity match",
     )
     parser.add_argument(
+        "--max-training-crops",
+        type=int,
+        default=DEFAULT_MAX_TRAINING_CROPS,
+        help="shared contrastive training crop cap; 0 disables the cap",
+    )
+    parser.add_argument(
+        "--max-embedding-crops",
+        type=int,
+        default=DEFAULT_MAX_EMBEDDING_CROPS,
+        help="per-video identity embedding crop cap; 0 disables the cap",
+    )
+    parser.add_argument(
         "--center",
         nargs=2,
         type=float,
@@ -116,6 +130,8 @@ def main():
         parser.error("--center must be given once or once per video")
     if args.inclusion_size and any(value <= 0 for value in args.inclusion_size):
         parser.error("--inclusion-size WIDTH and HEIGHT must both be positive")
+    if args.max_training_crops < 0 or args.max_embedding_crops < 0:
+        parser.error("crop caps must be zero (uncapped) or positive")
 
     project_dir = Path(args.project_dir).expanduser().resolve()
     videos = [Path(video).expanduser().resolve() for video in args.videos]
@@ -179,6 +195,10 @@ def main():
         args.device,
         "--min-location-fraction",
         args.min_location_fraction,
+        "--max-training-crops",
+        args.max_training_crops,
+        "--max-embedding-crops",
+        args.max_embedding_crops,
     ]
     if args.init_checkpoint:
         matching_command.extend(("--init-checkpoint", args.init_checkpoint))

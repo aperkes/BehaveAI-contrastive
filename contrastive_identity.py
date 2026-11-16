@@ -52,7 +52,7 @@ try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
-    from torch.utils.data import BatchSampler, DataLoader, Dataset
+    from torch.utils.data import BatchSampler, DataLoader, Dataset, Subset
     from torchvision.models.resnet import BasicBlock, ResNet
 except ImportError as exc:  # Keep --help and syntax inspection useful without PyTorch.
     torch = None
@@ -61,6 +61,7 @@ except ImportError as exc:  # Keep --help and syntax inspection useful without P
     BatchSampler = object
     DataLoader = None
     Dataset = object
+    Subset = None
     BasicBlock = None
     ResNet = object
     TORCH_IMPORT_ERROR = exc
@@ -71,9 +72,11 @@ else:
 DEFAULT_EMBEDDING_DIM = 128
 DEFAULT_IDTRACKER_EMBEDDING_DIM = 8
 DEFAULT_INPUT_SIZE = 96
+DEFAULT_MAX_TRAINING_CROPS = 250_000
+DEFAULT_MAX_EMBEDDING_CROPS = 250_000
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Detection:
     video: str
     frame: int
@@ -95,10 +98,62 @@ class TrainingFragmentMetadata:
 
     keys: list
     indices_by_fragment: dict
-    known_different: np.ndarray
+    known_different: tuple
     original_track_by_fragment: dict
     excluded_detection_count: int
     uncertainty_event_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class FragmentState:
+    track: tuple
+    x: float
+    y: float
+    scale: float
+
+
+def cooccurrence_graph(size, groups):
+    """Build compact symmetric neighbor lists from coexisting label groups."""
+    neighbors = [set() for _ in range(size)]
+    for labels in groups:
+        labels = sorted(labels)
+        for position, first in enumerate(labels):
+            for second in labels[position + 1:]:
+                neighbors[first].add(second)
+                neighbors[second].add(first)
+    return finalize_cooccurrence(neighbors)
+
+
+def finalize_cooccurrence(neighbors):
+    return tuple(
+        np.fromiter(sorted(values), dtype=np.int64) if values
+        else np.empty(0, dtype=np.int64)
+        for values in neighbors
+    )
+
+
+def cooccurrence_neighbors(graph, label):
+    if isinstance(graph, np.ndarray):
+        return np.flatnonzero(graph[label])
+    return graph[label]
+
+
+def cooccurrence_any(graph, label, candidates):
+    candidates = np.asarray(candidates, dtype=np.int64)
+    if not len(candidates):
+        return False
+    if isinstance(graph, np.ndarray):
+        return bool(graph[label, candidates].any())
+    return bool(np.intersect1d(graph[label], candidates, assume_unique=False).size)
+
+
+def dense_cooccurrence(graph):
+    if isinstance(graph, np.ndarray):
+        return graph
+    dense = np.zeros((len(graph), len(graph)), dtype=bool)
+    for label, neighbors in enumerate(graph):
+        dense[label, neighbors] = True
+    return dense
 
 
 def require_torch():
@@ -150,7 +205,23 @@ def report_progress(label, completed, total, started_at):
     )
 
 
-def read_manifests(manifest_paths, video_overrides=None, frame_step_overrides=None):
+def normalized_manifest_row(row, video, bbox):
+    copied = dict(row)
+    copied["source_video"] = video
+    source_id = copied.get("original_id") or copied.get("id") or copied["track_id"]
+    copied["id"] = copied.get("id") or source_id
+    copied["original_id"] = source_id
+    copied["x"] = copied.get("x") or str(int((bbox[0] + bbox[2]) / 2))
+    copied["y"] = copied.get("y") or str(int((bbox[1] + bbox[3]) / 2))
+    return copied
+
+
+def read_manifests(
+    manifest_paths,
+    video_overrides=None,
+    frame_step_overrides=None,
+    keep_raw_rows=True,
+):
     """Read one or more crop manifests and return detections plus raw rows."""
     if video_overrides and len(video_overrides) != len(manifest_paths):
         raise ValueError("Provide one --video for each --manifest, or omit --video.")
@@ -160,7 +231,7 @@ def read_manifests(manifest_paths, video_overrides=None, frame_step_overrides=No
         )
 
     detections = []
-    raw_rows = []
+    raw_rows = [] if keep_raw_rows else None
     for manifest_number, manifest_path in enumerate(manifest_paths):
         override = None
         if video_overrides:
@@ -218,27 +289,16 @@ def read_manifests(manifest_paths, video_overrides=None, frame_step_overrides=No
                     frame=int(row["frame"]),
                     track_id=str(row["track_id"]),
                     bbox=bbox,
-                    manifest_index=len(raw_rows),
+                    manifest_index=len(detections),
                     oriented_bbox=oriented_bbox,
                     frame_step=frame_step,
                 )
                 detections.append(detection)
-                copied_row = dict(row)
-                copied_row["source_video"] = video
-                source_id = (
-                    copied_row.get("original_id")
-                    or copied_row.get("id")
-                    or copied_row["track_id"]
-                )
-                copied_row["id"] = copied_row.get("id") or source_id
-                copied_row["original_id"] = source_id
-                copied_row["x"] = copied_row.get("x") or str(
-                    int((bbox[0] + bbox[2]) / 2)
-                )
-                copied_row["y"] = copied_row.get("y") or str(
-                    int((bbox[1] + bbox[3]) / 2)
-                )
-                raw_rows.append(copied_row)
+                if keep_raw_rows:
+                    copied_row = normalized_manifest_row(row, video, bbox)
+                    if not copied_row.get("frame_step"):
+                        copied_row["frame_step"] = str(frame_step)
+                    raw_rows.append(copied_row)
 
     if not detections:
         raise ValueError("No detections were found in the supplied manifest(s).")
@@ -255,29 +315,40 @@ def build_track_metadata(detections):
     track_keys = sorted({item.track_key for item in detections})
     track_to_label = {key: index for index, key in enumerate(track_keys)}
     indices_by_track = defaultdict(list)
-    tracks_by_frame = defaultdict(set)
-    seen_track_frames = set()
+    neighbors = [set() for _ in track_keys]
+    current_frame_key = None
+    current_frame_tracks = set()
+    current_frame_labels = set()
+
+    def finish_frame():
+        labels = sorted(current_frame_labels)
+        for position, first in enumerate(labels):
+            for second in labels[position + 1:]:
+                neighbors[first].add(second)
+                neighbors[second].add(first)
 
     for index, item in enumerate(detections):
-        track_frame = (item.video, item.frame, item.track_id)
-        if track_frame in seen_track_frames:
+        frame_key = (item.video, item.frame)
+        if frame_key != current_frame_key:
+            if current_frame_key is not None:
+                finish_frame()
+            current_frame_key = frame_key
+            current_frame_tracks = set()
+            current_frame_labels = set()
+        if item.track_id in current_frame_tracks:
             raise ValueError(
                 "Invalid crop manifest: track "
                 f"{item.track_id} occurs more than once in frame {item.frame} of "
                 f"{item.video}. Regenerate it with one detection per track per frame."
             )
-        seen_track_frames.add(track_frame)
+        current_frame_tracks.add(item.track_id)
         label = track_to_label[item.track_key]
         indices_by_track[label].append(index)
-        tracks_by_frame[(item.video, item.frame)].add(label)
+        current_frame_labels.add(label)
+    if current_frame_key is not None:
+        finish_frame()
 
-    known_different = np.zeros((len(track_keys), len(track_keys)), dtype=bool)
-    for labels in tracks_by_frame.values():
-        labels = list(labels)
-        for position, first in enumerate(labels):
-            for second in labels[position + 1:]:
-                known_different[first, second] = True
-                known_different[second, first] = True
+    known_different = finalize_cooccurrence(neighbors)
 
     return track_keys, track_to_label, indices_by_track, known_different
 
@@ -309,15 +380,13 @@ def build_conservative_training_fragments(
                 f"{previous_step} and {item.frame_step}"
             )
         x1, y1, x2, y2 = item.bbox
-        center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
         scale = max(x2 - x1, y2 - y1, 1)
-        state = {
-            "track": item.track_key,
-            "center": center,
-            "scale": float(scale),
-            "bbox": item.bbox,
-            "observed": True,
-        }
+        state = FragmentState(
+            item.track_key,
+            (x1 + x2) / 2.0,
+            (y1 + y2) / 2.0,
+            float(scale),
+        )
         observations_by_track[item.track_key].append((item.frame, index, state))
         states_by_video_frame[(item.video, item.frame)].append(state)
 
@@ -338,34 +407,22 @@ def build_conservative_training_fragments(
                 continue
             for frame in range(first_frame + frame_step, last_frame, frame_step):
                 fraction = (frame - first_frame) / raw_gap
-                center = (
-                    first["center"][0]
-                    + fraction * (last["center"][0] - first["center"][0]),
-                    first["center"][1]
-                    + fraction * (last["center"][1] - first["center"][1]),
-                )
-                scale = first["scale"] + fraction * (
-                    last["scale"] - first["scale"]
-                )
+                x = first.x + fraction * (last.x - first.x)
+                y = first.y + fraction * (last.y - first.y)
+                scale = first.scale + fraction * (last.scale - first.scale)
                 states_by_video_frame[(video, frame)].append(
-                    {
-                        "track": track,
-                        "center": center,
-                        "scale": scale,
-                        "bbox": None,
-                        "observed": False,
-                    }
+                    FragmentState(track, x, y, scale)
                 )
 
     uncertain = defaultdict(set)
 
     def mark(state, frame):
-        uncertain[state["track"]].add(frame)
+        uncertain[state.track].add(frame)
 
     def distance(first, second):
         return float(np.hypot(
-            first["center"][0] - second["center"][0],
-            first["center"][1] - second["center"][1],
+            first.x - second.x,
+            first.y - second.y,
         ))
 
     # Very close detections are locally ambiguous regardless of how many other
@@ -373,30 +430,30 @@ def build_conservative_training_fragments(
     for (_, frame), states in states_by_video_frame.items():
         for position, first in enumerate(states):
             for second in states[position + 1:]:
-                if first["track"] == second["track"]:
+                if first.track == second.track:
                     continue
-                scale = max((first["scale"] + second["scale"]) / 2.0, 1.0)
+                scale = max((first.scale + second.scale) / 2.0, 1.0)
                 if distance(first, second) / scale < close_distance:
                     mark(first, frame)
                     mark(second, frame)
 
     # Compare the recorded continuation with the alternative swapped matching.
     # A small cost advantage means the motion-only association was not decisive.
-    frames_by_video = defaultdict(list)
+    frames_by_video = defaultdict(set)
     for video, frame in states_by_video_frame:
-        frames_by_video[video].append(frame)
+        frames_by_video[video].add(frame)
     for video, frames in frames_by_video.items():
-        frame_set = set(frames)
+        frame_set = frames
         frame_step = frame_step_by_video[video]
         for frame in sorted(frame_set):
             if frame - frame_step not in frame_set:
                 continue
             previous = {
-                state["track"]: state
+                state.track: state
                 for state in states_by_video_frame[(video, frame - frame_step)]
             }
             current = {
-                state["track"]: state
+                state.track: state
                 for state in states_by_video_frame[(video, frame)]
             }
             common = sorted(set(previous).intersection(current))
@@ -411,10 +468,10 @@ def build_conservative_training_fragments(
                     scale = max(
                         np.mean(
                             [
-                                first_previous["scale"],
-                                first_current["scale"],
-                                second_previous["scale"],
-                                second_current["scale"],
+                                first_previous.scale,
+                                first_current.scale,
+                                second_previous.scale,
+                                second_current.scale,
                             ]
                         ),
                         1.0,
@@ -451,14 +508,14 @@ def build_conservative_training_fragments(
             ):
                 continue
             predicted = (
-                2 * second_state["center"][0] - first_state["center"][0],
-                2 * second_state["center"][1] - first_state["center"][1],
+                2 * second_state.x - first_state.x,
+                2 * second_state.y - first_state.y,
             )
             error = np.hypot(
-                third_state["center"][0] - predicted[0],
-                third_state["center"][1] - predicted[1],
+                third_state.x - predicted[0],
+                third_state.y - predicted[1],
             )
-            if error / max(third_state["scale"], 1.0) > motion_jump:
+            if error / max(third_state.scale, 1.0) > motion_jump:
                 uncertain[track].add(third_frame)
 
     expanded_uncertain = defaultdict(set)
@@ -473,7 +530,7 @@ def build_conservative_training_fragments(
     fragment_keys = []
     indices_by_fragment = {}
     original_track_by_fragment = {}
-    detection_to_fragment = {}
+    detection_to_fragment = np.full(len(detections), -1, dtype=np.int32)
     excluded = 0
     for track, observations in sorted(observations_by_track.items()):
         frame_step = frame_step_by_video[track[0]]
@@ -513,18 +570,30 @@ def build_conservative_training_fragments(
             previous_frame = frame
         finish_fragment()
 
-    fragments_by_frame = defaultdict(set)
+    neighbors = [set() for _ in fragment_keys]
+    current_frame_key = None
+    current_fragments = set()
+
+    def finish_frame():
+        labels = sorted(current_fragments)
+        for position, first in enumerate(labels):
+            for second in labels[position + 1:]:
+                neighbors[first].add(second)
+                neighbors[second].add(first)
+
     for index, item in enumerate(detections):
-        fragment = detection_to_fragment.get(index)
-        if fragment is not None:
-            fragments_by_frame[(item.video, item.frame)].add(fragment)
-    known_different = np.zeros((len(fragment_keys), len(fragment_keys)), dtype=bool)
-    for fragments in fragments_by_frame.values():
-        fragments = sorted(fragments)
-        for position, first in enumerate(fragments):
-            for second in fragments[position + 1:]:
-                known_different[first, second] = True
-                known_different[second, first] = True
+        frame_key = (item.video, item.frame)
+        if frame_key != current_frame_key:
+            if current_frame_key is not None:
+                finish_frame()
+            current_frame_key = frame_key
+            current_fragments = set()
+        fragment = int(detection_to_fragment[index])
+        if fragment >= 0:
+            current_fragments.add(fragment)
+    if current_frame_key is not None:
+        finish_frame()
+    known_different = finalize_cooccurrence(neighbors)
 
     return TrainingFragmentMetadata(
         keys=fragment_keys,
@@ -548,6 +617,67 @@ def use_original_tracks_as_training_fragments(metadata):
         excluded_detection_count=0,
         uncertainty_event_count=0,
     )
+
+
+def capped_fragment_indices(
+    indices_by_fragment,
+    maximum_crops,
+    minimum_per_fragment,
+    label,
+):
+    """Select time-spaced crops while retaining broad fragment coverage."""
+    eligible = sorted(
+        fragment
+        for fragment, indices in indices_by_fragment.items()
+        if len(indices) >= minimum_per_fragment
+    )
+    total = sum(len(indices_by_fragment[fragment]) for fragment in eligible)
+    if maximum_crops <= 0 or total <= maximum_crops:
+        print(f"{label}: using all {total:,} eligible crops.", flush=True)
+        return {
+            fragment: list(indices_by_fragment[fragment]) for fragment in eligible
+        }
+    maximum_fragments = maximum_crops // minimum_per_fragment
+    if maximum_fragments < 1:
+        raise ValueError(
+            f"{label} cap {maximum_crops:,} is smaller than the required "
+            f"{minimum_per_fragment} crops per fragment."
+        )
+    if len(eligible) > maximum_fragments:
+        positions = np.linspace(
+            0, len(eligible) - 1, maximum_fragments, dtype=np.int64
+        )
+        eligible = [eligible[int(position)] for position in np.unique(positions)]
+
+    lengths = np.asarray(
+        [len(indices_by_fragment[fragment]) for fragment in eligible], dtype=np.int64
+    )
+    quotas = np.minimum(lengths, minimum_per_fragment)
+    remaining = maximum_crops - int(quotas.sum())
+    capacities = lengths - quotas
+    while remaining > 0 and capacities.sum() > 0:
+        shares = remaining * capacities / capacities.sum()
+        additions = np.minimum(capacities, np.floor(shares).astype(np.int64))
+        if not additions.any():
+            order = np.argsort(-shares)
+            additions[order[: min(remaining, len(order))]] = 1
+            additions = np.minimum(additions, capacities)
+        quotas += additions
+        capacities -= additions
+        remaining -= int(additions.sum())
+
+    selected = {}
+    for fragment, quota in zip(eligible, quotas):
+        indices = indices_by_fragment[fragment]
+        positions = np.linspace(0, len(indices) - 1, int(quota), dtype=np.int64)
+        selected[fragment] = [indices[int(position)] for position in np.unique(positions)]
+    selected_count = sum(len(indices) for indices in selected.values())
+    print(
+        f"{label}: selected {selected_count:,}/{total:,} crops from "
+        f"{len(selected):,} fragments (cap {maximum_crops:,}).",
+        flush=True,
+    )
+    return selected
 
 
 def write_training_fragment_summary(path, fragments, detections):
@@ -1098,7 +1228,9 @@ class TrackBatchSampler(BatchSampler):
     def __iter__(self):
         for _ in range(self.batches_per_epoch):
             anchor = random.choice(self.track_labels)
-            negative_candidates = np.flatnonzero(self.known_different[anchor]).tolist()
+            negative_candidates = cooccurrence_neighbors(
+                self.known_different, anchor
+            ).tolist()
             random.shuffle(negative_candidates)
             selected = [anchor]
             selected.extend(negative_candidates[: self.tracks_per_batch - 1])
@@ -1370,13 +1502,20 @@ def train_model(
     model, embedding_dim, projection_dim, input_size = make_model(
         args, device, args.init_checkpoint
     )
-    preload_indices = None
-    if model.architecture == "idtracker-resnet18" and training_fragments is not None:
-        preload_indices = [
-            index
-            for indices in training_fragments.indices_by_fragment.values()
-            for index in indices
-        ]
+    source_indices = (
+        training_fragments.indices_by_fragment
+        if training_fragments is not None
+        else indices_by_track
+    )
+    training_indices = capped_fragment_indices(
+        source_indices,
+        args.max_training_crops,
+        args.min_fragment_length,
+        "Training crop selection",
+    )
+    preload_indices = [
+        index for indices in training_indices.values() for index in indices
+    ]
     if args.crop_storage != "on-demand" and preloaded_crop_store is None:
         preloaded_crop_store = make_preloaded_crop_store(
             args,
@@ -1413,24 +1552,19 @@ def train_model(
         )
 
     if model.architecture == "idtracker-resnet18":
-        fragment_indices = (
-            training_fragments.indices_by_fragment
-            if training_fragments is not None
-            else indices_by_track
-        )
         fragment_differences = (
             training_fragments.known_different
             if training_fragments is not None
             else known_different
         )
         best_state = _train_idtracker_style(
-            args, model, dataset, fragment_indices, fragment_differences, device
+            args, model, dataset, training_indices, fragment_differences, device
         )
         if best_state is not None:
             model.load_state_dict(best_state)
     else:
         _train_legacy_style(
-            args, model, dataset, indices_by_track, known_different, detections, device
+            args, model, dataset, training_indices, known_different, detections, device
         )
 
     output_dir = Path(args.output_dir)
@@ -1462,6 +1596,7 @@ def train_model(
                 "minimum_length": args.min_fragment_length,
             },
             "epochs": args.epochs,
+            "max_training_crops": args.max_training_crops,
         },
         checkpoint_path,
     )
@@ -1488,7 +1623,7 @@ def _train_legacy_style(
     )
     loader = DataLoader(dataset, batch_sampler=sampler, num_workers=0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
-    known_different_tensor = torch.from_numpy(known_different)
+    known_different_tensor = torch.from_numpy(dense_cooccurrence(known_different))
     print(
         f"Legacy small-CNN training on {len(detections)} detections using {device}; "
         f"effective batch {effective_batch_size} images."
@@ -1531,7 +1666,7 @@ def _train_idtracker_style(
     negative_pairs = [
         (first, second)
         for first in eligible
-        for second in np.flatnonzero(known_different[first])
+        for second in cooccurrence_neighbors(known_different, first)
         if first < second and int(second) in eligible_set
     ]
     if not eligible:
@@ -1734,6 +1869,7 @@ def extract_embeddings(
     device,
     background_store,
     preloaded_crop_store,
+    detection_indices=None,
 ):
     _, track_to_label, _, _ = metadata
     dataset = VideoCropDataset(
@@ -1748,8 +1884,13 @@ def extract_embeddings(
         preloaded_crop_store=preloaded_crop_store,
         input_channels=model.input_channels,
     )
+    selected_dataset = (
+        dataset
+        if detection_indices is None
+        else Subset(dataset, [int(index) for index in detection_indices])
+    )
     loader = DataLoader(
-        dataset,
+        selected_dataset,
         batch_size=args.inference_batch_size,
         shuffle=False,
         num_workers=0,
@@ -1762,13 +1903,14 @@ def extract_embeddings(
             description = f"complete preloaded {preloaded_crop_store.storage.upper()} store"
         else:
             description = (
-                f"{selected} preloaded training crops plus on-demand decoding "
-                f"for {len(detections) - selected} remaining detections"
+                f"{selected} preloaded crops plus on-demand decoding for any "
+                "additional selected detections"
             )
         print(f"Embedding crop loading: {description}.", flush=True)
     else:
         print(
-            f"Embedding crop loading: on demand with a {args.cache_crops}-crop RAM cache.",
+            f"Embedding {len(selected_dataset):,} selected crops on demand with a "
+            f"{args.cache_crops}-crop RAM cache.",
             flush=True,
         )
     extraction_started = perf_counter()
@@ -1791,8 +1933,11 @@ def extract_embeddings(
 
 
 def read_latent_embeddings(path, detections):
-    """Load saved detection embeddings and verify manifest row alignment."""
+    """Load full or sampled embeddings and recover their manifest indices."""
     path = Path(path)
+    vectors = []
+    detection_indices = []
+    cursor = 0
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         latent_fields = sorted(
@@ -1800,43 +1945,58 @@ def read_latent_embeddings(path, detections):
         )
         if not latent_fields:
             raise ValueError(f"No latent coordinates found in {path}")
-        embeddings = np.empty(
-            (len(detections), len(latent_fields)), dtype=np.float32
-        )
-        count = 0
-        for count, row in enumerate(reader, start=1):
-            if count > len(detections):
+        for row_number, row in enumerate(reader, start=2):
+            row_video = os.path.abspath(row["source_video"])
+            row_frame = int(row["frame"])
+            row_track = row["track_id"]
+            while cursor < len(detections):
+                detection = detections[cursor]
+                if (
+                    detection.video == row_video
+                    and detection.frame == row_frame
+                    and detection.track_id == row_track
+                ):
+                    break
+                cursor += 1
+            if cursor >= len(detections):
                 raise ValueError(
-                    f"{path} has more rows than its crop manifest; cannot resume safely."
-                )
-            detection = detections[count - 1]
-            if (
-                int(row["frame"]) != detection.frame
-                or row["track_id"] != detection.track_id
-                or os.path.abspath(row["source_video"]) != detection.video
-            ):
-                raise ValueError(
-                    f"{path} row {count + 1} does not match its crop manifest; "
+                    f"{path} row {row_number} does not match its crop manifest; "
                     "rerun prediction instead of reusing these embeddings."
                 )
-            embeddings[count - 1] = [float(row[name]) for name in latent_fields]
-    if count != len(detections):
-        raise ValueError(
-            f"{path} contains {count} rows but its crop manifest contains "
-            f"{len(detections)} detections."
-        )
-    print(f"Reusing {count:,} saved detection embeddings from {path}", flush=True)
-    return embeddings
+            detection_indices.append(cursor)
+            vectors.append([float(row[name]) for name in latent_fields])
+            cursor += 1
+    if not vectors:
+        raise ValueError(f"No detection embeddings found in {path}")
+    embeddings = np.asarray(vectors, dtype=np.float32)
+    detection_indices = np.asarray(detection_indices, dtype=np.int64)
+    print(
+        f"Reusing {len(embeddings):,} saved detection embeddings from {path}",
+        flush=True,
+    )
+    return embeddings, detection_indices
 
 
-def aggregate_tracks(embeddings, detections, track_to_label, track_count):
+def aggregate_tracks(
+    embeddings, detections, track_to_label, track_count, detection_indices=None
+):
     track_embeddings = np.zeros((track_count, embeddings.shape[1]), dtype=np.float32)
     counts = np.zeros(track_count, dtype=np.int64)
-    for vector, item in zip(embeddings, detections):
+    items = (
+        detections
+        if detection_indices is None
+        else (detections[int(index)] for index in detection_indices)
+    )
+    for vector, item in zip(embeddings, items):
         label = track_to_label[item.track_key]
         track_embeddings[label] += vector
         counts[label] += 1
-    track_embeddings /= counts[:, None]
+    np.divide(
+        track_embeddings,
+        counts[:, None],
+        out=track_embeddings,
+        where=counts[:, None] > 0,
+    )
     return track_embeddings, counts
 
 
@@ -1954,7 +2114,7 @@ def export_pair_samples(
     negative_pairs = [
         (first, int(second))
         for first in eligible
-        for second in np.flatnonzero(known_different[first])
+        for second in cooccurrence_neighbors(known_different, first)
         if first < second and int(second) in eligible_set
     ]
     if not eligible or not negative_pairs:
@@ -2254,41 +2414,54 @@ def find_reference_training_fragments(
         detection_to_fragment[indices] = fragment
         fragment_lengths[fragment] = len(indices)
 
-    fragments_by_frame = defaultdict(set)
-    for index, item in enumerate(detections):
-        fragment = detection_to_fragment[index]
-        if fragment >= 0:
-            fragments_by_frame[(item.video, item.frame)].add(int(fragment))
+    group_statistics = {}
+    current_frame_key = None
+    current_labels = set()
 
-    frames_by_group = defaultdict(list)
-    for (video, frame), labels in fragments_by_frame.items():
-        if len(labels) == number_of_individuals:
-            frames_by_group[(video, tuple(sorted(labels)))].append(frame)
+    def finish_frame(frame_key):
+        if len(current_labels) != number_of_individuals:
+            return
+        video, frame = frame_key
+        key = (video, tuple(sorted(current_labels)))
+        count, first, last = group_statistics.get(key, (0, frame, frame))
+        group_statistics[key] = (count + 1, min(first, frame), max(last, frame))
+
+    for index, item in enumerate(detections):
+        frame_key = (item.video, item.frame)
+        if frame_key != current_frame_key:
+            if current_frame_key is not None:
+                finish_frame(current_frame_key)
+            current_frame_key = frame_key
+            current_labels = set()
+        fragment = int(detection_to_fragment[index])
+        if fragment >= 0:
+            current_labels.add(fragment)
+    if current_frame_key is not None:
+        finish_frame(current_frame_key)
 
     candidates = [
-        (key, frames)
-        for key, frames in frames_by_group.items()
+        (key, statistics)
+        for key, statistics in group_statistics.items()
         if min(fragment_lengths[label] for label in key[1]) >= minimum_frames
     ]
     if not candidates:
         return None
-    (video, labels), frames = max(
+    (video, labels), (frame_count, first_frame, last_frame) = max(
         candidates,
         key=lambda item: (
-            len(item[1]),
+            item[1][0],
             min(fragment_lengths[label] for label in item[0][1]),
         ),
     )
     return {
         "video": video,
         "fragment_labels": labels,
-        "coexisting_frames": tuple(frames),
-        "coexisting_frame_count": len(frames),
+        "coexisting_frame_count": frame_count,
         "minimum_fragment_detections": int(
             min(fragment_lengths[label] for label in labels)
         ),
-        "first_frame": min(frames),
-        "last_frame": max(frames),
+        "first_frame": first_frame,
+        "last_frame": last_frame,
     }
 
 
@@ -2323,7 +2496,7 @@ def assign_fragments_with_cooccurrence(p1, known_different, fixed_assignments=No
     # thousands of conservative fragments in a long video.
     p2 = np.empty_like(p1)
     for fragment in range(fragment_count):
-        neighbors = np.flatnonzero(known_different[fragment])
+        neighbors = cooccurrence_neighbors(known_different, fragment)
         if len(neighbors):
             log_scores = np.log(np.clip(p1[fragment], 1e-300, 1.0))
             log_scores += np.log(
@@ -2354,7 +2527,7 @@ def assign_fragments_with_cooccurrence(p1, known_different, fixed_assignments=No
         key=lambda fragment: (-certainty[fragment], -p2[fragment].max(), fragment),
     )
     for fragment in order:
-        neighbors = np.flatnonzero(known_different[fragment])
+        neighbors = cooccurrence_neighbors(known_different, fragment)
         forbidden = set(assignments[neighbors][assignments[neighbors] >= 0].tolist())
         available = np.asarray(
             [identity for identity in range(number_of_individuals) if identity not in forbidden],
@@ -2378,15 +2551,21 @@ def conservative_fragment_identity_assignment(
     seed,
     global_fragment_min_frames,
     metric="euclidean",
+    embedding_indices=None,
 ):
     """Cluster safe crop embeddings and vote identities per safe fragment."""
     detection_fragments = np.full(len(detections), -1, dtype=np.int64)
     for fragment, indices in fragments.indices_by_fragment.items():
         detection_fragments[indices] = fragment
-    safe_indices = np.flatnonzero(detection_fragments >= 0)
-    if len(safe_indices) < number_of_individuals:
+    if embedding_indices is None:
+        embedding_indices = np.arange(len(detections), dtype=np.int64)
+    else:
+        embedding_indices = np.asarray(embedding_indices, dtype=np.int64)
+    embedded_fragments = detection_fragments[embedding_indices]
+    safe_positions = np.flatnonzero(embedded_fragments >= 0)
+    if len(safe_positions) < number_of_individuals:
         raise ValueError(
-            "Too few detections survived conservative fragment filtering to "
+            "Too few embedded detections survived conservative fragment filtering to "
             "form the requested identity clusters."
         )
 
@@ -2399,24 +2578,68 @@ def conservative_fragment_identity_assignment(
     initial_centers = None
     fixed_assignments = {}
     if reference is not None:
-        reference_frames = set(reference["coexisting_frames"])
+        reference_positions = {
+            fragment: [
+                position
+                for position in safe_positions
+                if embedded_fragments[position] == fragment
+            ]
+            for fragment in reference["fragment_labels"]
+        }
+        sampled_frame_sets = [
+            {
+                detections[int(embedding_indices[position])].frame
+                for position in reference_positions[fragment]
+            }
+            for fragment in reference["fragment_labels"]
+        ]
+        shared_sampled_frames = (
+            set.intersection(*sampled_frame_sets)
+            if sampled_frame_sets and all(sampled_frame_sets)
+            else set()
+        )
+        if shared_sampled_frames:
+            labels_by_candidate_frame = defaultdict(set)
+            for detection_index, item in enumerate(detections):
+                if (
+                    item.video == reference["video"]
+                    and item.frame in shared_sampled_frames
+                ):
+                    fragment = int(detection_fragments[detection_index])
+                    if fragment >= 0:
+                        labels_by_candidate_frame[item.frame].add(fragment)
+            reference_labels = set(reference["fragment_labels"])
+            shared_sampled_frames = {
+                frame
+                for frame, labels in labels_by_candidate_frame.items()
+                if labels == reference_labels
+            }
         centers = []
         for identity, fragment in enumerate(reference["fragment_labels"]):
-            indices = [
-                index
-                for index in fragments.indices_by_fragment[fragment]
-                if detections[index].frame in reference_frames
-            ]
-            if not indices:
-                indices = fragments.indices_by_fragment[fragment]
-            if len(indices) > 500:
-                positions = np.linspace(0, len(indices) - 1, 500, dtype=np.int64)
-                indices = np.asarray(indices)[positions]
-            centers.append(embeddings[indices].mean(axis=0))
+            positions = reference_positions[fragment]
+            if not positions:
+                reference = None
+                centers = []
+                fixed_assignments = {}
+                break
+            if shared_sampled_frames:
+                positions = [
+                    position
+                    for position in positions
+                    if detections[int(embedding_indices[position])].frame
+                    in shared_sampled_frames
+                ]
+            if len(positions) > 500:
+                selected_positions = np.linspace(
+                    0, len(positions) - 1, 500, dtype=np.int64
+                )
+                positions = [positions[int(index)] for index in selected_positions]
+            centers.append(embeddings[positions].mean(axis=0))
             fixed_assignments[fragment] = identity
-        initial_centers = np.asarray(centers, dtype=np.float32)
+        if centers:
+            initial_centers = np.asarray(centers, dtype=np.float32)
 
-    safe_embeddings = embeddings[safe_indices]
+    safe_embeddings = embeddings[safe_positions]
     if metric == "euclidean":
         detection_clusters, _, _ = euclidean_kmeans(
             safe_embeddings,
@@ -2436,7 +2659,7 @@ def conservative_fragment_identity_assignment(
         )
     p1 = fragment_identity_probabilities(
         detection_clusters,
-        detection_fragments[safe_indices],
+        embedded_fragments[safe_positions],
         len(fragments.keys),
         number_of_individuals,
     )
@@ -2453,11 +2676,12 @@ def conservative_fragment_identity_assignment(
         )
 
     detection_identities = np.full(len(detections), -1, dtype=np.int64)
-    assigned_safe = assignments[detection_fragments[safe_indices]]
-    detection_identities[safe_indices] = assigned_safe
+    all_safe_indices = np.flatnonzero(detection_fragments >= 0)
+    detection_identities[all_safe_indices] = assignments[
+        detection_fragments[all_safe_indices]
+    ]
     if reference is not None:
         reference = dict(reference)
-        reference.pop("coexisting_frames")
         reference["fragment_labels"] = list(reference["fragment_labels"])
     return assignments, confidences, p1, p2, reference, detection_identities
 
@@ -2472,7 +2696,7 @@ def enforce_identity_exclusivity(assignments, confidences, known_different):
         candidates = sorted(candidates, key=lambda track: (-confidences[track], track))
         accepted = []
         for track in candidates:
-            if accepted and known_different[track, accepted].any():
+            if accepted and cooccurrence_any(known_different, track, accepted):
                 assignments[track] = -1
                 confidences[track] = 0.0
                 demoted.append(track)
@@ -2483,7 +2707,9 @@ def enforce_identity_exclusivity(assignments, confidences, known_different):
     for position, first in enumerate(assigned_tracks):
         conflicts = assigned_tracks[position + 1 :]
         same_identity = assignments[conflicts] == assignments[first]
-        assert not known_different[first, conflicts[same_identity]].any()
+        assert not cooccurrence_any(
+            known_different, first, conflicts[same_identity]
+        )
     return assignments, confidences, demoted
 
 
@@ -2554,6 +2780,72 @@ def identity_prediction_fields(raw_rows):
         if name not in fields:
             fields.append(name)
     return fields
+
+
+def iter_normalized_manifest_rows(
+    manifest_paths, video_overrides=None, frame_step_overrides=None
+):
+    for manifest_number, manifest_path in enumerate(manifest_paths):
+        override = (
+            os.path.abspath(video_overrides[manifest_number])
+            if video_overrides
+            else None
+        )
+        step_override = None
+        if frame_step_overrides:
+            step_override = (
+                frame_step_overrides[0]
+                if len(frame_step_overrides) == 1
+                else frame_step_overrides[manifest_number]
+            )
+        with open(manifest_path, newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                video = override or os.path.abspath(row["source_video"])
+                bbox = tuple(
+                    int(float(row[name])) for name in ("x1", "y1", "x2", "y2")
+                )
+                output = normalized_manifest_row(row, video, bbox)
+                if not output.get("frame_step"):
+                    output["frame_step"] = str(step_override or 1)
+                yield output
+
+
+def write_streamed_identity_rows(
+    path,
+    manifest_paths,
+    video_overrides,
+    frame_step_overrides,
+    detection_identities,
+):
+    """Write full predictions without retaining original CSV rows in RAM."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    writer = None
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        for count, row in enumerate(
+            iter_normalized_manifest_rows(
+                manifest_paths, video_overrides, frame_step_overrides
+            ),
+            start=1,
+        ):
+            if count > len(detection_identities):
+                raise ValueError("Manifest gained rows while writing identity predictions.")
+            if writer is None:
+                writer = csv.DictWriter(
+                    handle, fieldnames=identity_prediction_fields([row])
+                )
+                writer.writeheader()
+            identity = int(detection_identities[count - 1])
+            row["id"] = identity
+            row["predicted_identity"] = identity
+            writer.writerow(row)
+    if count != len(detection_identities):
+        raise ValueError(
+            f"Manifest contains {count} rows but {len(detection_identities)} "
+            "identity predictions were produced."
+        )
 
 
 def write_identity_rows(path, raw_rows, detections, track_to_label, identity_by_track):
@@ -2841,9 +3133,52 @@ def run_inference(
     preloaded_crop_store,
     training_fragments,
     embeddings=None,
+    embedding_indices=None,
 ):
     track_keys, track_to_label, _, _ = metadata
+    embedding_store_created = False
     if embeddings is None:
+        if args.max_embedding_crops == 0:
+            embedding_indices = np.arange(len(detections), dtype=np.int64)
+            print(
+                f"Identity embedding crop selection: uncapped; embedding all "
+                f"{len(detections):,} detections.",
+                flush=True,
+            )
+        else:
+            source_indices = (
+                training_fragments.indices_by_fragment
+                if training_fragments is not None
+                else metadata[2]
+            )
+            selected_by_fragment = capped_fragment_indices(
+                source_indices,
+                args.max_embedding_crops,
+                1,
+                "Identity embedding crop selection",
+            )
+            embedding_indices = np.asarray(
+                sorted(
+                    index
+                    for indices in selected_by_fragment.values()
+                    for index in indices
+                ),
+                dtype=np.int64,
+            )
+        if (
+            args.max_embedding_crops > 0
+            and args.crop_storage != "on-demand"
+            and preloaded_crop_store is None
+        ):
+            preloaded_crop_store = make_preloaded_crop_store(
+                args,
+                detections,
+                input_size,
+                background_store,
+                model.input_channels,
+                embedding_indices,
+            )
+            embedding_store_created = True
         embeddings = extract_embeddings(
             args,
             model,
@@ -2853,9 +3188,19 @@ def run_inference(
             device,
             background_store,
             preloaded_crop_store,
+            embedding_indices,
         )
+        if embedding_store_created:
+            preloaded_crop_store.release()
+            preloaded_crop_store = None
+    elif embedding_indices is None:
+        embedding_indices = np.arange(len(detections), dtype=np.int64)
     track_embeddings, track_counts = aggregate_tracks(
-        embeddings, detections, track_to_label, len(track_keys)
+        embeddings,
+        detections,
+        track_to_label,
+        len(track_keys),
+        embedding_indices,
     )
     metric = "euclidean" if model.architecture == "idtracker-resnet18" else "cosine"
     if metric == "cosine":
@@ -2889,6 +3234,7 @@ def run_inference(
                 args.seed,
                 args.global_fragment_min_frames,
                 metric,
+                embedding_indices,
             )
             if reference is None:
                 print(
@@ -2910,9 +3256,6 @@ def run_inference(
             reference = None
         identity_path = output_dir / "identity_predictions.csv"
         if args.identity_assignment == "idtracker":
-            write_detection_identity_rows(
-                identity_path, raw_rows, identity_by_detection
-            )
             diagnostics_path = output_dir / "identity_assignment_fragments.csv"
             write_fragment_assignment_diagnostics(
                 diagnostics_path,
@@ -2932,8 +3275,12 @@ def run_inference(
                 identity_by_detection,
             )
         else:
-            write_identity_rows(
-                identity_path, raw_rows, detections, track_to_label, identity_by_track
+            identity_by_detection = np.asarray(
+                [
+                    identity_by_track[track_to_label[item.track_key]]
+                    for item in detections
+                ],
+                dtype=np.int64,
             )
             diagnostics_path = output_dir / "identity_assignment_tracks.csv"
             write_assignment_diagnostics(
@@ -2951,8 +3298,22 @@ def run_inference(
                 assignment_confidence,
                 reference,
             )
+        if raw_rows is None:
+            write_streamed_identity_rows(
+                identity_path,
+                args.manifest,
+                args.video,
+                args.frame_step,
+                identity_by_detection,
+            )
+        else:
+            write_detection_identity_rows(
+                identity_path, raw_rows, identity_by_detection
+            )
         quality["assignment_method"] = args.identity_assignment
         quality["num_individuals"] = args.num_individuals
+        quality["max_embedding_crops"] = args.max_embedding_crops
+        quality["embedded_detection_count"] = len(embedding_indices)
         quality_path = output_dir / "identity_assignment_quality.json"
         quality_path.write_text(json.dumps(quality, indent=2), encoding="utf-8")
         print(f"Saved identity predictions: {identity_path}")
@@ -2969,6 +3330,14 @@ def run_inference(
     if args.mode == "embed" or args.export_latents:
         latent_path = Path(args.export_latents) if args.export_latents else output_dir / "latents.csv"
         track_latent_path = latent_path.with_name(latent_path.stem + "_tracks" + latent_path.suffix)
+        latent_detections = [detections[int(index)] for index in embedding_indices]
+        latent_detection_identities = (
+            identity_by_detection[embedding_indices]
+            if identity_by_detection is not None
+            else None
+        )
+        sampled_track_labels = np.flatnonzero(track_counts > 0)
+        sampled_track_embeddings = track_embeddings[sampled_track_labels]
         detection_projection = None
         track_projection = None
         projection_name = None
@@ -2979,7 +3348,7 @@ def run_inference(
             )
             detection_projection, track_projection, projection_name = project_embeddings(
                 embeddings,
-                track_embeddings,
+                sampled_track_embeddings,
                 method=args.latent_projection,
                 dimensions=args.visualization_dimensions,
                 fit_sample_limit=args.projection_fit_samples,
@@ -2990,19 +3359,23 @@ def run_inference(
         write_latents(
             latent_path,
             embeddings,
-            detections,
+            latent_detections,
             track_to_label,
             identity_by_track,
             detection_projection,
             projection_name,
-            identity_by_detection,
+            latent_detection_identities,
         )
         write_track_latents(
             track_latent_path,
-            track_embeddings,
-            track_keys,
-            track_counts,
-            identity_by_track,
+            sampled_track_embeddings,
+            [track_keys[int(label)] for label in sampled_track_labels],
+            track_counts[sampled_track_labels],
+            (
+                identity_by_track[sampled_track_labels]
+                if identity_by_track is not None
+                else None
+            ),
             track_projection,
             projection_name,
         )
@@ -3141,6 +3514,24 @@ def build_parser():
     )
 
     parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument(
+        "--max-training-crops",
+        type=int,
+        default=DEFAULT_MAX_TRAINING_CROPS,
+        help=(
+            "maximum representative crops available to contrastive training; "
+            "0 uses every eligible crop"
+        ),
+    )
+    parser.add_argument(
+        "--max-embedding-crops",
+        type=int,
+        default=DEFAULT_MAX_EMBEDDING_CROPS,
+        help=(
+            "maximum representative crops embedded for fragment identity assignment; "
+            "0 embeds every eligible crop"
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument(
         "--architecture",
@@ -3331,6 +3722,8 @@ def validate_args(args, parser):
             parser.error("--frame-step must be at least 1")
     if args.pairs_per_batch < 1:
         parser.error("--pairs-per-batch must be at least 1")
+    if args.max_training_crops < 0 or args.max_embedding_crops < 0:
+        parser.error("crop caps must be zero (uncapped) or positive")
     if args.forward_pair_chunk_size < 1:
         parser.error("--forward-pair-chunk-size must be at least 1")
     if args.min_fragment_length < 2:
@@ -3405,7 +3798,10 @@ def main():
         background_store = MedianBackgroundStore(args.background_samples, args.seed)
 
     detections, raw_rows = read_manifests(
-        args.manifest, args.video, args.frame_step
+        args.manifest,
+        args.video,
+        args.frame_step,
+        keep_raw_rows=False,
     )
     metadata = build_track_metadata(detections)
     training_fragments = None
@@ -3511,11 +3907,12 @@ def main():
             )
             preloaded_crop_store.release()
             preloaded_crop_store = None
-        reused_embeddings = (
-            read_latent_embeddings(args.reuse_latents, detections)
-            if args.mode == "reassign"
-            else None
-        )
+        if args.mode == "reassign":
+            reused_embeddings, reused_embedding_indices = read_latent_embeddings(
+                args.reuse_latents, detections
+            )
+        else:
+            reused_embeddings = reused_embedding_indices = None
         run_inference(
             args,
             model,
@@ -3528,6 +3925,7 @@ def main():
             preloaded_crop_store,
             training_fragments,
             reused_embeddings,
+            reused_embedding_indices,
         )
 
 
