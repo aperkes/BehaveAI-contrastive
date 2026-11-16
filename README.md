@@ -1,7 +1,27 @@
 <img width="400" height="69" alt="BehaveAI_400" src="https://github.com/user-attachments/assets/6fb5cd16-d266-4e8b-9513-1734a45813bf" />
 
-This is the original maintained repo for BehaveAI (https://github.com/troscianko/BehaveAI)
+This is a modified fork of the original BehaveAI (https://github.com/troscianko/BehaveAI)
 
+You should check out the original, and this repo is unlikely to be completely stable, however it is designed to be compatible and preserve all functions of BehaveAI, while adding a few additional ones, most noteable contrastive learning for identity recognition. I've added a quick summary of the changes I've made. A good portion of this code was vibe coded using chatGPT, so proceed with all appropriate caution. 
+
+CLI: 
+simple_track.py began as a useful wrapper on BehaveAI for batch processing but now has several additional functions, including exporting a crop manifest for downstream contrastive learning.
+
+Contrastive Learning: 
+contrastive_identity.py uses the crop manifest and the number of individuals to learn identities. There are few additional help scripts including idenity_pipeline.py and identity_overlay.py. Proper docs should be forthcoming. 
+
+Changes to functionality of BehaveAI
+I wanted to play around with some alternative motion algorithms, including simple background subtraction. It made sense to restructure BehaveAI slightly so that the motion generation was a single function call, and have these functions contained in motion_processor.py, so that I could change that function depending on the method used. 
+While i was at it, I allowed for the motion to be based on a different stride, making it possible to intergrate longer timescales of motion without skipping frames in the tracking itself. 
+
+Some minor bug-fixes and optimizations:
+When assigned tracks, it was possible for two detections to receive the same track ID. ([9643cd7](https://github.com/troscianko/BehaveAI/commit/9643cd7fa28c5fddcff6f199433e2f9c886724e2))
+Oriented-box crops are extracted a single time and then rotated instead of rotating the entire image four times. ([f826da1](https://github.com/troscianko/BehaveAI/commit/f826da14fbb8f8bcda9181eaf4e80f05cb31280a))
+Tracking expected a YAML file to exist even if that model type (e.g., motion) was disabled. ([644bffb](https://github.com/troscianko/BehaveAI/commit/644bffb2ea0fde1f43261ec54af8de3e3178343f))
+
+I'm working on proper documentation of all the new code. For now I had chatGPT spit one out, see DOCS.md.
+
+Everything below is the original README:
 # A framework for detecting, classifying and tracking moving objects
 
 BehaveAI is a user-friendly tool that identifies and classifies animals and other objects in video footage from their movement as well as their static appearance. The framework converts motion information into false colours that allow both the human annotator and convolutional neural network (CNN) to easily identify patterns of movement. The framework integrates both motion streams and static streams in a similar fashion to the mammalian visual system, separating the tasks of detection and classification.
